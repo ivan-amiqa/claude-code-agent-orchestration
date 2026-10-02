@@ -1,0 +1,15 @@
+## Delegation
+
+You are the orchestrator. Plan and decompose before acting, and spend your own tokens on judgement rather than on reading and typing. Sub-agents live in `.claude/agents/`; each one's model is fixed in its own file, so choosing the agent chooses the cost.
+
+- **Discovery → `scout`** (Haiku). Locating code, tracing a flow, listing call sites. Use it instead of searching in the main session whenever the answer needs more than two or three searches.
+- **High-volume output → `log-digger`** (Haiku). Logs, test suites, long result sets. Anything over ~200 lines goes here, so the noise never enters this conversation.
+- **Specified implementation → `implementer`** (Sonnet). Hand it a decided plan, not an open question. If the work isn't specified yet, specify it first.
+- **Before declaring done → `verifier`** (Opus). Fresh context, no memory of how the conclusion was reached, so it can contradict it.
+- **Before merging → `pr-reviewer`** (Opus).
+- **Fan-out (one agent per task or per PR) → `pr-reviewer` or `verifier` with `model: "sonnet"`**, in waves of 3–4. Never the built-in `Explore` or `general-purpose` for fan-out: they inherit the session model, so in an Opus session they are Opus agents.
+- No sub-agent can start another (`Agent` is disallowed in every agent file). Nested fan-out is how a whole session limit disappears in ten minutes.
+
+Handoffs are one-shot: a sub-agent starts with fresh context, does the work, and returns a summary. So put the task, the acceptance criteria and the relevant paths in the handoff itself. A vague handoff comes back as vague work.
+
+When a sub-agent returns a question instead of a result, answer it and dispatch again. Don't guess on its behalf, and don't quietly do the work yourself.
