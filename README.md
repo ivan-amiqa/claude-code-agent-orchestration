@@ -14,11 +14,18 @@ mkdir -p .claude/agents && cp claude-code-agent-orchestration/.claude/agents/*.m
 # or:  mkdir -p ~/.claude/agents && cp claude-code-agent-orchestration/.claude/agents/*.md ~/.claude/agents/
 ```
 
-Then:
+Then let Claude fit them to your project. Paste this into Claude Code:
 
-1. Add the delegation rules from [`CLAUDE.md.example`](CLAUDE.md.example) to your own `CLAUDE.md`, so the boss knows when to use each agent.
-2. Edit the invariants in `implementer.md` and `pr-reviewer.md` for your project.
-3. Start a new Claude Code session and run `/agents` to check they're loaded.
+```text
+Read claude-code-agent-orchestration/CLAUDE.md.example and merge its delegation rules into
+this project's CLAUDE.md. Don't overwrite what's there: if a rule conflicts with an existing
+one, or with my existing agents in .claude/agents/, list the conflicts and ask me before
+changing anything. Then replace the placeholder invariants in .claude/agents/implementer.md
+and .claude/agents/pr-reviewer.md with this project's real ones, based on the code, and show
+me the diff.
+```
+
+Finally, start a new Claude Code session and run `/agents` to check they're loaded.
 
 ## Why it saves money
 
