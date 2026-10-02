@@ -2,7 +2,7 @@
 
 A small, copyable setup for running [Claude Code](https://code.claude.com) as **one boss and a team of cheaper specialists**, plus a script to measure what it saves you.
 
-From the talk *AI in the Wild: what it actually costs to build with it* (Digit, Tartu, 9 October 2026) by Ivan Elorza Tahum.
+From the talk *AI in the Wild: what it actually costs to build with it* (Digit, Tartu, 9 October 2026) by Iván Elorza Tahum.
 
 ## Use it
 
