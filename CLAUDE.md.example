@@ -1,15 +1,26 @@
 ## Delegation
 
-You are the orchestrator. Plan and decompose before acting, and spend your own tokens on judgement rather than on reading and typing. Sub-agents live in `.claude/agents/`; each one's model is fixed in its own file, so choosing the agent chooses the cost.
+You are the orchestrator. Plan and decompose before acting, and spend your own tokens on judgement rather than on reading and typing. Sub-agents live in `.claude/agents/`; each one's model is fixed in its own file with the full model id (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`), not an alias, so the version can't drift. Choosing the agent chooses the cost.
 
-- **Discovery → `scout`** (Haiku). Locating code, tracing a flow, listing call sites. Use it instead of searching in the main session whenever the answer needs more than two or three searches.
-- **High-volume output → `log-digger`** (Haiku). Logs, test suites, long result sets. Anything over ~200 lines goes here, so the noise never enters this conversation.
-- **Specified implementation → `implementer`** (Sonnet). Hand it a decided plan, not an open question. If the work isn't specified yet, specify it first.
-- **Before declaring done → `verifier`** (Opus). Fresh context, no memory of how the conclusion was reached, so it can contradict it.
-- **Before merging → `pr-reviewer`** (Opus).
+- **Discovery → `scout`** (Haiku 5.5). Locating code, tracing a flow, listing call sites. Use it instead of searching in the main session whenever the answer needs more than two or three searches.
+- **High-volume output → `log-digger`** (Haiku 5.5). Logs, test suites, long result sets. Anything over ~200 lines goes here, so the noise never enters this conversation.
+- **Specified implementation → `implementer`** (Sonnet 5.5). Hand it a decided plan, not an open question. If the work isn't specified yet, specify it first.
+- **Before declaring done → `verifier`** (Opus 5.5). Fresh context, no memory of how the conclusion was reached, so it can contradict it.
+- **Before merging → `pr-reviewer`** (Opus 5.5).
 - **Fan-out (one agent per task or per PR) → `pr-reviewer` or `verifier` with `model: "sonnet"`**, in waves of 3–4. Never the built-in `Explore` or `general-purpose` for fan-out: they inherit the session model, so in an Opus session they are Opus agents.
 - No sub-agent can start another (`Agent` is disallowed in every agent file). Nested fan-out is how a whole session limit disappears in ten minutes.
 
 Handoffs are one-shot: a sub-agent starts with fresh context, does the work, and returns a summary. So put the task, the acceptance criteria and the relevant paths in the handoff itself. A vague handoff comes back as vague work.
 
 When a sub-agent returns a question instead of a result, answer it and dispatch again. Don't guess on its behalf, and don't quietly do the work yourself.
+
+## Verify, don't assume
+
+Docs, notes, an agent's summary, an earlier session's summary and your own memory are snapshots: they describe how things were when written, and code, data and infrastructure move faster. Before a conclusion rests on one, confirm it against live state: the file on the remote branch, the running database, the real cloud resource, the current ticket.
+
+- Label the basis of every claim: "verified — <how>" for what you checked, "unverified" for what you're carrying on trust. An unverified assumption that a conclusion depends on is a next step, not a footnote.
+- `git fetch` before any "is X fixed?" question, and check sub-agents' citations against the remote branch, never against a local working tree.
+- A green CI check is evidence only when the run's head commit is the commit you're vouching for. Cite the run and the commit together.
+- An admin account proves nothing about a normal user: anything gated on a role is checked with that role's own permissions.
+- When a fix "improved but didn't fix" the problem, your model of the bug is wrong. Challenge the hypothesis instead of tuning inside it.
+- If live state contradicts a doc or a note, the doc is stale: fix it in the same session.

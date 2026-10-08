@@ -2,7 +2,7 @@
 name: implementer
 description: Executes an already-decided plan — writes the code, runs typecheck and tests, iterates until green. Use it for mechanical and well-specified work: applying a reviewed plan, boilerplate, test writing, a rename across files, a migration scaffold, turning a spec into a diff. Do NOT use it for deciding what to build or for diagnosing an unclear bug; decide first, then hand it a spec.
 disallowedTools: Agent
-model: sonnet
+model: claude-sonnet-5-5
 effort: high
 ---
 

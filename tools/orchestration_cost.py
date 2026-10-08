@@ -26,20 +26,28 @@ import argparse, glob, json, os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-# $ per million tokens: (input, output, cache read). Check https://platform.claude.com/docs/en/about-claude/pricing
-# Keys are matched as substrings of the model id, in this order.
+# $ per million tokens: (input, output, cache read). Checked 8 October 2026 on
+# https://platform.claude.com/docs/en/about-claude/pricing. Update when prices change.
+# Keys are matched as substrings of the model id, in this order (most specific first).
 PRICES = {
     'opus-5-5': (4, 20, 0.20),
     'opus-5': (5, 25, 0.50),
     'fable': (10, 50, 0.25),
+    'sonnet-5-5': (2, 10, 0.10),
     'sonnet': (2, 10, 0.20),
-    'haiku': (1, 5, 0.10),
+    'haiku-5-5': (0.10, 0.50, 0.01),
+    'haiku': (1, 5, 0.10),          # Haiku 4.5
 }
+# Haiku 5.5 is priced by prompt length: prompts over 100,000 tokens pay these instead.
+PRICES_LONG = {'haiku-5-5': (0.50, 2.50, 0.05)}
+LONG_PROMPT = 100_000
 CACHE_WRITE = 1.25   # x input price
 
-def price(model):
+def price(model, u=None):
     for k, p in PRICES.items():
         if k in (model or ''):
+            if u is not None and k in PRICES_LONG and context(u) > LONG_PROMPT:
+                return PRICES_LONG[k]
             return p
 
 def cost(u, p):
@@ -100,7 +108,7 @@ def main():
             for _, m, _ in mc:
                 n[m] += 1
             boss = price(max(n, key=n.get)) or PRICES['opus-5-5']
-            T['main'] += sum(cost(u, price(m)) for _, m, u in mc if price(m))
+            T['main'] += sum(cost(u, price(m, u)) for _, m, u in mc if price(m))
             spans, reads = [], []
             for s in sorted(glob.glob(f'{d}/{sid}/subagents/*.jsonl')):
                 sc = calls(s)
@@ -111,7 +119,7 @@ def main():
                 except (OSError, ValueError):
                     meta = {}
                 kind = f"{meta.get('agentType', '?')} [{sc[0][1].replace('claude-', '')}]"
-                actual = sum(cost(u, price(m)) for _, m, u in sc if price(m))
+                actual = sum(cost(u, price(m, u)) for _, m, u in sc if price(m))
                 as_boss = sum(cost(u, boss) for _, m, u in sc)
                 dur = sc[-1][0] - sc[0][0]
                 B = by[kind]; B['runs'] += 1; B['actual'] += actual; B['as_boss'] += as_boss; B['hours'] += dur / 3600

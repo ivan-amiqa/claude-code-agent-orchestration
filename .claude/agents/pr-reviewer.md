@@ -2,7 +2,7 @@
 name: pr-reviewer
 description: Reviews a feature-branch diff before it merges. Use when a branch or PR is ready for review. Reads the diff against the correct base, checks the project's invariants, and reports findings ranked by severity. Never edits and never merges.
 disallowedTools: Edit, Write, NotebookEdit, Agent, RemoteTrigger, CronCreate
-model: opus
+model: claude-opus-5-5
 effort: high
 ---
 

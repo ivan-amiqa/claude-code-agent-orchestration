@@ -2,7 +2,7 @@
 name: verifier
 description: Independent fresh-context check of a claim or a finished change — "is X actually fixed?", "does this really work for a normal user?", "is this doc still true?". Runs with no memory of how the conclusion was reached, so it can contradict it. Use before declaring work done, before reporting a fix, and whenever a conclusion rests on docs, notes, or an earlier session.
 disallowedTools: Edit, Write, NotebookEdit, Agent, RemoteTrigger, CronCreate
-model: opus
+model: claude-opus-5-5
 effort: high
 ---
 
