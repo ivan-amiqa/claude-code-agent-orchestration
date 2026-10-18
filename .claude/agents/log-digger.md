@@ -2,6 +2,7 @@
 name: log-digger
 description: Triage high-volume output — cloud logs, container logs, test suite runs, build failures, long SQL result sets — and return only the signal. Use whenever the raw output would be more than ~200 lines, so the noise stays out of the main conversation.
 tools: Read, Bash, Grep
+disallowedTools: Agent
 model: claude-haiku-5-5
 ---
 

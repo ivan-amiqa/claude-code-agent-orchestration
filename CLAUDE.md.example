@@ -2,17 +2,28 @@
 
 You are the orchestrator. Plan and decompose before acting, and spend your own tokens on judgement rather than on reading and typing. Sub-agents live in `.claude/agents/`; each one's model is fixed in its own file with the full model id (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`), not an alias, so the version can't drift. Choosing the agent chooses the cost.
 
-- **Discovery → `scout`** (Haiku 5.5). Locating code, tracing a flow, listing call sites. Use it instead of searching in the main session whenever the answer needs more than two or three searches.
-- **High-volume output → `log-digger`** (Haiku 5.5). Logs, test suites, long result sets. Anything over ~200 lines goes here, so the noise never enters this conversation.
+- **Discovery → `scout`** (Haiku 5.5). Locating code, tracing a flow, enumerating call sites, reading code to understand it. The main session may open **one file it already knows by path** to check or edit it; anything beyond that (a second file, a `grep`/`find` across the repo, `cat` or `sed -n` to see how something works) goes to `scout`. A detailed brief that already names the files is not an exception: hand those paths to `scout` and ask the question.
+- **High-volume output → `log-digger`** (Haiku 5.5). Logs, cloud output, long result sets, and **every test-suite run**, full suite or a comparison against the base branch. Anything that can exceed ~200 lines goes here, so the noise never enters this conversation.
+- **What stays in the main session**: git, `gh`, CI and deploy waits, one-liner queries whose answer is a few lines, and small one-off edits. Anything bigger, once the plan is decided, goes to `implementer`.
 - **Specified implementation → `implementer`** (Sonnet 5.5). Hand it a decided plan, not an open question. If the work isn't specified yet, specify it first.
 - **Before declaring done → `verifier`** (Opus 5.5). Fresh context, no memory of how the conclusion was reached, so it can contradict it.
 - **Before merging → `pr-reviewer`** (Opus 5.5).
 - **Fan-out (one agent per task or per PR) → `pr-reviewer` or `verifier` with `model: "sonnet"`**, in waves of 3–4. Never the built-in `Explore` or `general-purpose` for fan-out: they inherit the session model, so in an Opus session they are Opus agents.
 - No sub-agent can start another (`Agent` is disallowed in every agent file). Nested fan-out is how a whole session limit disappears in ten minutes.
+- Every agent file pins its `model` (the full id); the Opus and Sonnet agents also pin `effort` (Haiku ignores it, so those files leave it out). A call-time `model: "sonnet"` override is still an alias: it follows the next release, while the files stay put.
 
 Handoffs are one-shot: a sub-agent starts with fresh context, does the work, and returns a summary. So put the task, the acceptance criteria and the relevant paths in the handoff itself. A vague handoff comes back as vague work.
 
 When a sub-agent returns a question instead of a result, answer it and dispatch again. Don't guess on its behalf, and don't quietly do the work yourself.
+
+### Guard hooks (optional)
+
+Two hooks in `.claude/hooks/` back these rules up; `.claude/settings.json` wires them in.
+
+- `delegation-guard.sh` **reminds** after 6 code-reading calls with no `scout`/`log-digger` call, after 4 code edits with no `implementer` call, and on `gh pr create`/`merge` with no `verifier` started since the last code change. It **blocks** a PR merge (`gh pr merge`, `gh api …/pulls/N/merge`, enabling auto-merge) unless `pr-reviewer` was started on that PR after the last code change. A reminder means you are already past the rule, not that the rule starts there.
+- It only knows the reviewer was *started*, not what it concluded. Read the verdict before you merge.
+- If the PR was reviewed some other way (a teammate's review, another session), or you are merging your own work without review, say so in the command and the merge goes through: `gh pr merge 123 … # reviewed-by: teammate review in PR comments`.
+- `worktree-guard.sh` never blocks. Before a state-changing `git`/`gh` command it prints which repo and branch the command will hit, so a wrong checkout is noticed before the damage.
 
 ## Verify, don't assume
 

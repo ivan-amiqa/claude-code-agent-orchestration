@@ -14,6 +14,20 @@ mkdir -p .claude/agents && cp claude-code-agent-orchestration/.claude/agents/*.m
 # or:  mkdir -p ~/.claude/agents && cp claude-code-agent-orchestration/.claude/agents/*.md ~/.claude/agents/
 ```
 
+### Optional: the guard hooks
+
+The agents work on their own. Two hooks make the rules harder to forget. They need `jq` and are per project: copy them next to your agents.
+
+```bash
+mkdir -p .claude/hooks && cp claude-code-agent-orchestration/.claude/hooks/*.sh .claude/hooks/ && chmod +x .claude/hooks/*.sh
+cp claude-code-agent-orchestration/.claude/settings.json .claude/settings.json   # or merge its "hooks" block into yours
+```
+
+- [`delegation-guard.sh`](.claude/hooks/delegation-guard.sh) reminds the boss to delegate (after 6 code-reading calls with no scout/log-digger, after 4 code edits with no implementer, and on `gh pr create`/`merge` with no verifier run). It **blocks** `gh pr merge` unless `pr-reviewer` was started on that PR after the last code change. It only knows the reviewer was started, not its verdict: read it before you merge. If the review happened elsewhere, add `# reviewed-by: <reason>` to the merge command. Thresholds and the folders it treats as "not code" are environment variables, documented at the top of the script.
+- [`worktree-guard.sh`](.claude/hooks/worktree-guard.sh) never blocks. Before a state-changing `git`/`gh` command it prints which repo and branch it will hit.
+
+To disable one, delete its entry from `.claude/settings.json`; to disable both, delete the file or the `hooks` block. Without `jq` the delegation checks switch themselves off, except that merges are refused rather than waved through.
+
 Then let Claude fit them to your project. Paste this into Claude Code:
 
 ```text
@@ -51,7 +65,7 @@ Orchestration attacks that in two ways:
 
 1. **Agents can't start agents.** Every agent that doesn't need it has `disallowedTools: Agent`. We once launched 12 checkers at once; each started its own helpers, and the whole session limit was gone in about ten minutes, with zero results. Test it in a fresh session: ask an agent to list its tools.
 2. **Waves of 3 or 4, never 12 at once.** Each wave finishes before the next starts.
-3. **Pin `model` and `effort` in every agent file, with the full model id.** Claude Code's built-in `Explore` helper has no fixed model: it inherits your session's. In an Opus session, every "cheap" search is an Opus search. And write `claude-haiku-5-5`, not `haiku`: an alias silently moves to the next version, with a new price and new behaviour. (The call-time `model: "sonnet"` override in rule 4 only accepts aliases.)
+3. **Pin `model` in every agent file, with the full model id, and `effort` on the Opus and Sonnet agents (Haiku ignores it).** Claude Code's built-in `Explore` helper has no fixed model: it inherits your session's. In an Opus session, every "cheap" search is an Opus search. And write `claude-haiku-5-5`, not `haiku`: an alias silently moves to the next version, with a new price and new behaviour. (The call-time `model: "sonnet"` override in rule 4 only accepts aliases.)
 4. **Copies run on Sonnet.** When one job fans out to many copies (one reviewer per PR, say), pass `model: "sonnet"` on each call instead of letting them inherit the boss's model.
 
 And one habit under all four: **verify, don't assume.** Cheap agents are only a saving if their answers are checked. The scout cites `file:line` with the command to reproduce it, the verifier tries to prove the boss wrong, and [`CLAUDE.md.example`](CLAUDE.md.example) tells the boss to treat every doc, note and summary as a claim until it's checked against live state.
@@ -78,6 +92,10 @@ It reads your local logs in `~/.claude/projects`, needs only Python 3, and sends
 **Update, 8 October 2026:** Haiku 5.5 launched on 7 October at a tenth of Haiku 4.5's price, so the scout and log-digger jobs are now about ten times cheaper again. Two catches: prompts over 100,000 tokens cost five times more, and the same text counts as more tokens. The script prices both.
 
 One trap it avoids: don't select sessions by file date. Claude Code can touch old session files, and our first count of "the last two weeks" silently included two older months.
+
+## Updates
+
+**Update, October 2026:** the repo now ships the hooks above (`delegation-guard.sh`, `worktree-guard.sh`) and a `.claude/settings.json` that wires them in. `CLAUDE.md.example` gained the stricter delegation rules (the main session opens at most one known file; every test-suite run goes to `log-digger`; what stays in the main session; effort pinned on the Opus and Sonnet agents; the `model: "sonnet"` override is an alias), `scout` and `log-digger` now carry `disallowedTools: Agent` so rule 1 is literally true in every file, and `verifier` names any stale doc it finds.
 
 ## Licence
 

@@ -26,6 +26,8 @@ Every line in your report is one of:
 - `unverified — <why>`: you could not check it. Say what would settle it.
 - `contradicted — <evidence>`: live state disagrees with the claim.
 
+If a doc or a memory file turned out to be stale, name the file so it gets fixed.
+
 ## Report format
 
 ```
