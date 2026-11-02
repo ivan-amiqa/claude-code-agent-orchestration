@@ -361,7 +361,7 @@ test('gh missing shows "gh unavailable" and never throws', async ($, on) => {
   await ui.unmount()
 })
 
-test('the status line shows context, cache, cost and agents by model', async ($, on) => {
+test('the status line is empty while nothing needs attention', async ($, on) => {
   const lines: (string | undefined)[] = []
   on('session.measure', (_, e) => ({ changed: e.changed }))
   on('ui.status', (_, e) => {
@@ -374,7 +374,62 @@ test('the status line shows context, cache, cost and agents by model', async ($,
 
   await $.session.measure({ context: { tokens: 142_000, window: 1_000_000 }, rateLimits: [], cost: { usd: 3.4 }, changed: ['context', 'cost'] })
 
-  expect(lines[lines.length - 1]).toBe('142k ctx · cache n/a · $3.40')
+  expect(lines.length).toBeGreaterThan(0)
+  expect(lines[lines.length - 1]).toBeUndefined()
+})
+
+test('the status line warns from 350k, escalates at 500k, and clears when the condition ends', async ($, on) => {
+  const lines: (string | undefined)[] = []
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.status', (_, e) => {
+    lines.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: NOW }))
+  const at = async (tokens: number) => {
+    await $.session.measure({ context: { tokens, window: 1_000_000 }, rateLimits: [], cost: { usd: 2 }, changed: ['context', 'cost'] })
+
+    return lines[lines.length - 1]
+  }
+
+  expect(await at(349_000)).toBeUndefined()
+  expect(await at(362_000)).toBe('Meter: context 362k — consider /compact')
+  expect(await at(512_000)).toBe('Meter: context 512k — start fresh')
+  expect(await at(90_000)).toBeUndefined() // /compact
+})
+
+test('the status line says the cache is cold only while the context is big, and clears with the next response', async ($, on) => {
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  const clock = mock.clock(on, { now: NOW })
+  const lines: (string | undefined)[] = []
+  on('ui.status', (_, e) => {
+    lines.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+  let ctx = 200_000
+  on('session.usage', () => usageAt(1, ctx))
+  on('turn.step', async function* (_, e) {
+    return stepResult(e, 'claude-opus-5-5')
+  })
+
+  for await (const _ of $.turn.step(stepInput())) void _
+  expect(lines[lines.length - 1]).toBeUndefined() // warm
+  await clock.advance(80 * MIN)
+  expect(lines[lines.length - 1]).toBe('Meter: cache cold — fresh session cheaper')
+
+  for await (const _ of $.turn.step(stepInput())) void _ // a new response warms it again
+  expect(lines[lines.length - 1]).toBeUndefined()
+
+  ctx = 50_000 // small context: cold is not worth a warning
+  const before = lines.filter(l => l !== undefined).length
+  for await (const _ of $.turn.step(stepInput())) void _
+  await clock.advance(80 * MIN)
+  expect(lines.filter(l => l !== undefined)).toHaveLength(before) // no new warning
+  expect(lines[lines.length - 1]).toBeUndefined()
 })
 
 test('a subagent request is told apart by agentId: its tokens and ledger growth land on its row', async ($, on) => {

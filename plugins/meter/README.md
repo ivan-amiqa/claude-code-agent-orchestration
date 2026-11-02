@@ -34,7 +34,7 @@ Then run `/meter` to open the pane.
 | **Dollars per step** | A column chart of main-conversation steps, each split into what was re-read from cache, what was newly stored, and the model's answer, with a mark where you ran `/compact` |
 | **Guard** | A line for every agent the mod blocked or switched |
 
-The status line under the prompt carries the same headline: context size, cache state, cost, agents.
+The status line under the prompt stays empty and only appears with a warning: context past 350k or 500k, or a cold cache while the context is large.
 
 `/meter` also prints a one-line summary into the chat (session cost, context, cache, agents, CI).
 

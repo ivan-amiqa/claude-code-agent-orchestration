@@ -148,13 +148,17 @@ function agentCounts(d: MeterData): string {
   return names.map(n => `${by.get(n)} ${n}`).join(', ')
 }
 
-function statusLine(d: MeterData): string {
-  const c = cacheInfo(d)
-  const cache = c.state === 'none' ? 'cache n/a' : c.state === 'cold' ? 'cache cold' : `cache ${c.state === 'cooling' ? 'cooling' : 'warm'} ${leftShort(c.leftMs)}`
-  const parts = [`${tokens(d.contextTokens)} ctx`, cache, usd(d.costUsd)]
-  if (d.agents.length > 0) parts.push(`${d.agents.length} agent${d.agents.length === 1 ? '' : 's'} (${agentCounts(d)})`)
+/**
+ * The status line is empty unless something needs attention. One entry at a
+ * time, in this order: context >= 500k, context >= 350k, cache cold while a
+ * re-write would still be big. `undefined` clears the entry.
+ */
+function statusLine(d: MeterData): string | undefined {
+  if (d.contextTokens >= BAD_AT) return `Meter: context ${tokens(d.contextTokens)} — start fresh`
+  if (d.contextTokens >= WARN_AT) return `Meter: context ${tokens(d.contextTokens)} — consider /compact`
+  if (cacheInfo(d).state === 'cold' && d.contextTokens > FRESH_AT) return 'Meter: cache cold — fresh session cheaper'
 
-  return parts.join(' · ')
+  return undefined
 }
 
 function ciWorst(prs: MeterPr[]): string {
