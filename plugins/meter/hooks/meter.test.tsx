@@ -247,7 +247,7 @@ const gh = (stdout: string) => ({
   value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
 })
 // `gh pr view <url> --json title,state,isDraft,additions,deletions,statusCheckRollup,number,url`,
-// in the shape real gh answers (captured from `gh pr view 12 --repo acme/web-api`).
+// in the shape real gh answers (captured from `12 --repo acme/web-api`).
 const run = (name: string, conclusion: string, status = 'COMPLETED') => ({
   __typename: 'CheckRun',
   completedAt: '2026-10-31T12:00:56Z',
@@ -1021,15 +1021,20 @@ test('token formatting: under 1k as is, k with no decimals, 1.1M at a million', 
   expect([0, 999, 1_000, 48_400, 310_000, 999_400, 1_100_000, 2_460_000].map(tokens)).toEqual(['0', '999', '1k', '48k', '310k', '999k', '1.1M', '2.5M'])
 })
 
-test('two bars (Cost, Tokens written) share colours; the legend says both values per bucket', async ($, on) => {
+test('two bars (Cost, Tokens written) share colours; each bar has its own legend (money under Cost, written tokens under Tokens written)', async ($, on) => {
   on('state.get', (_, e) => stored(live(), e))
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ type: 'Text', text: 'Cost' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'Tokens written' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Sonnet ≈\$0\.92 · 48k written/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Opus \(main\) ≈\$1\.32 · 21k written/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Opus \(agents\) ≈\$1\.04 · 9k written/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Sonnet ≈$0.92' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Opus (main) ≈$1.32' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Opus (agents) ≈$1.04' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Sonnet 48k' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Opus (main) 21k' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Opus (agents) 9k' })).toBeDefined()
+    // the old combined legend is gone
+    expect(await ui.find({ type: 'Text', text: /≈\$.* · .*written/ })).toBeUndefined()
     await ui.unmount()
   }
 
@@ -1076,7 +1081,9 @@ test('a bucket with no cost and nothing written is not drawn', async ($, on) => 
   expect(await ui.find({ type: 'Text', text: /Haiku ≈/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /Sonnet ≈/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /Opus \(agents\) ≈/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /Opus \(main\) ≈\$3\.40 · 30k written/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Opus (main) ≈$3.40' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Opus (main) 30k' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Haiku/ })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -1101,11 +1108,35 @@ test('"Before Meter loaded" is the grey first part of the cost bar and makes the
   }
 })
 
+test('the cost legend carries money only, the tokens legend carries token counts only and no Before Meter loaded', async ($, on) => {
+  on('state.get', (_, e) => stored(live({ costUsd: 5.4 }), e)) // 2.00 from before
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    const buckets = /^(Before Meter loaded|Opus \((main|agents)\)|Haiku|Sonnet)/
+    const costLegend = texts.filter(t => buckets.test(t) && /≈\$/.test(t) && !/ read /.test(t))
+    const tokenLegend = texts.filter(t => /^(Opus \((main|agents)\)|Haiku|Sonnet) [0-9.]+[kM]?$/.test(t))
+    expect(costLegend.length).toBe(5)
+    for (const t of costLegend) {
+      expect(t).toMatch(/≈\$[0-9.]+$/)
+      expect(t).not.toContain('written')
+    }
+    expect(tokenLegend).toEqual(['Opus (main) 21k', 'Haiku 2k', 'Sonnet 48k', 'Opus (agents) 9k'])
+    for (const t of tokenLegend) {
+      expect(t).not.toContain('$')
+      expect(t).not.toContain('Before Meter loaded')
+    }
+    expect(texts.some(t => /^Before Meter loaded ≈\$/.test(t))).toBe(true)
+    expect(texts.filter(t => t.includes('Before Meter loaded')).length).toBe(1) // only under Cost
+    await ui.unmount()
+  }
+})
+
 test('a session with nothing booked yet and no cost before it draws no bucket and no grey', async ($, on) => {
   on('state.get', (_, e) => stored(live({ costUsd: 0, spend: { 'opus-main': 0, haiku: 0, sonnet: 0, 'opus-checks': 0 }, written: { 'opus-main': 0, haiku: 0, sonnet: 0, 'opus-checks': 0 }, agents: [], groups: [] }), e))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /Before Meter loaded/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /written/ })).toBeDefined() // the bar's own label
+  expect(await ui.find({ type: 'Text', text: 'Tokens written' })).toBeDefined() // the bar's own label
   await ui.unmount()
 })
 
@@ -1123,7 +1154,8 @@ test('a main-thread step books its output tokens and cost to the bucket, and add
   for await (const _ of $.turn.step(stepInput())) void _
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /Opus \(main\) ≈\$0\.40 · 20 written/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Opus (main) ≈$0.40' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Opus (main) 20' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'Dollars per step' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'no steps yet' })).toBeUndefined()
   await ui.unmount()

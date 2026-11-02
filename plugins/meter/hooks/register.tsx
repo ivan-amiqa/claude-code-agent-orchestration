@@ -1340,10 +1340,12 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   const grey: Color = svgOn ? l.palette.before : GREY
   const costItems: Item[] = [...(before > 0 ? [{ color: grey, value: before }] : []), ...shown.map(b => ({ color: tone(b), value: d.spend[b] }))]
   const tokenItems: Item[] = shown.map(b => ({ color: tone(b), value: d.written[b] }))
-  const legend: { color: Color; text: string }[] = [
+  // One legend under each bar, in the bar's own order: money under Cost, written tokens under Tokens written.
+  const costLegend: { color: Color; text: string }[] = [
     ...(before > 0 ? [{ color: grey, text: `Before Meter loaded ≈${usd(before)}` }] : []),
-    ...shown.map(b => ({ color: tone(b), text: `${BUCKET_LABEL[b]} ≈${usd(d.spend[b])} · ${tokens(d.written[b])} written` })),
+    ...shown.map(b => ({ color: tone(b), text: `${BUCKET_LABEL[b]} ≈${usd(d.spend[b])}` })),
   ]
+  const tokenLegend: { color: Color; text: string }[] = shown.map(b => ({ color: tone(b), text: `${BUCKET_LABEL[b]} ${tokens(d.written[b])}` }))
   const w = svgWidth(l)
   const stacked = (items: Item[], alt: string): RenderElement =>
     drawSvg(l, alt, w, BAR_HEIGHT, () => barSvg(items, l.palette, w)) ?? bar(k, splitParts(l.width, items))
@@ -1356,10 +1358,18 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
       <Text wrap="truncate-end">{e.text}</Text>
     </Box>
   )
-  const legendRows: RenderElement[] = []
   const step = twoCols ? 2 : 1
-  for (let i = 0; i < legend.length; i += step) {
-    legendRows.push(<Box>{legend.slice(i, i + step).map(e => entry(e, twoCols ? half : undefined))}</Box>)
+  const legendBox = (legend: { color: Color; text: string }[]): RenderElement => {
+    const rows: RenderElement[] = []
+    for (let i = 0; i < legend.length; i += step) {
+      rows.push(<Box>{legend.slice(i, i + step).map(e => entry(e, twoCols ? half : undefined))}</Box>)
+    }
+
+    return (
+      <Box flexDirection="column" marginTop={1}>
+        {rows}
+      </Box>
+    )
   }
   const groups = groupAgents(d.agents)
   const recent = groups.slice(0, 8)
@@ -1370,13 +1380,12 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
     caption(k, '≈ split of the session total by step · tokens exact'),
     barLabel(k, 'Cost'),
     stacked(costItems, `Cost by who did the work, total ${usd(d.costUsd)}`),
+    legendBox(costLegend),
     <Box marginTop={1} flexDirection="column">
       {barLabel(k, 'Tokens written')}
       {stacked(tokenItems, 'Tokens written by who did the work')}
     </Box>,
-    <Box flexDirection="column" marginTop={1}>
-      {legendRows}
-    </Box>,
+    legendBox(tokenLegend),
     <Box flexDirection="column" marginTop={1}>
       {d.agents.length === 0 ? caption(k, 'no agents yet') : null}
       {groups.length > recent.length ? caption(k, `${groups.length - recent.length} more agent types not shown`) : null}
