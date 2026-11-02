@@ -5,7 +5,7 @@ import type { On } from 'claude-code'
 
 import type { MeterData, MeterGroup, MeterPr } from '../types'
 
-import { addToGroups, agentRowText, barSvg, beforeLoaded, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, niceTicks, niceTop, PALETTES, paletteFor, PRICE_RATIO, prUrlsIn, ringSvg, rollup, sane, sanePrs, splitCost, splitParts, stackCells, tokens, truncate } from './register'
+import { addToGroups, agentRowText, barSvg, beforeLoaded, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, niceTicks, niceTop, PALETTES, paletteFor, PRICE_RATIO, prUrlsIn, ringSvg, rollup, sane, sanePrs, shares, splitCost, splitParts, stackCells, tokens, truncate } from './register'
 
 const PANE = {
   plugin: 'meter',
@@ -1130,6 +1130,47 @@ test('the cost legend carries money only, the tokens legend carries token counts
     expect(texts.filter(t => t.includes('Before Meter loaded')).length).toBe(1) // only under Cost
     await ui.unmount()
   }
+})
+
+test('legend shares: whole percents by largest remainder, <1% under half a percent, nothing at a zero total', () => {
+  const sum = (xs: string[]) => xs.reduce((n, t) => n + (t === '<1%' ? 0 : parseInt(t, 10)), 0)
+  const cost = shares([17.95, 2.41, 0.02, 3.19])
+  expect(cost).toEqual(['76%', '10%', '<1%', '14%'])
+  expect(sum(cost)).toBe(100)
+  const tok = shares([21_000, 16_000, 150_000])
+  expect(tok).toEqual(['11%', '9%', '80%'])
+  expect(sum(tok)).toBe(100)
+  // thirds: 33.33 each, the leftover point goes to the first of equal remainders
+  expect(sum(shares([1, 1, 1]))).toBe(100)
+  expect(shares([0, 0])).toEqual(['', ''])
+  expect(shares([])).toEqual([])
+  expect(shares([5, 0])).toEqual(['100%', '0%'])
+  expect(shares([1, 1000])).toEqual(['<1%', '100%'])
+  expect(shares([Number.NaN, 4])).toEqual(['0%', '100%'])
+})
+
+test('both legends show each entry share of its own bar, dim, on terminal and desktop', async ($, on) => {
+  on('state.get', (_, e) => stored(live({ costUsd: 5.4 }), e)) // 2.00 before + 3.40 booked
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const pcts = (await ui.findAll({ type: 'Text' })).filter(t => /^· (<1|\d+)%$/.test(t.text))
+    // cost: before, Opus (main), Haiku, Sonnet, Opus (agents); tokens: Opus (main), Haiku, Sonnet, Opus (agents)
+    expect(pcts.map(t => t.text)).toEqual(['· 37%', '· 25%', '· 2%', '· 17%', '· 19%', '· 26%', '· 3%', '· 60%', '· 11%'])
+    expect(pcts.every(t => t.props.dimColor === true)).toBe(true)
+    // the money and token values stay their own entries
+    expect(await ui.find({ type: 'Text', text: 'Before Meter loaded ≈$2.00' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Sonnet 48k' })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('a zero total draws no percent in the legends', async ($, on) => {
+  on('state.get', (_, e) => stored(live({ costUsd: 0, spend: { 'opus-main': 0, haiku: 0, sonnet: 0, 'opus-checks': 0 }, written: { 'opus-main': 0, haiku: 0, sonnet: 5, 'opus-checks': 0 } }), e))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const pcts = (await ui.findAll({ type: 'Text' })).filter(t => /^· (<1|\d+)%$/.test(t.text))
+  // cost total is zero: no cost percent; the one token entry is 100%
+  expect(pcts.map(t => t.text)).toEqual(['· 100%'])
+  await ui.unmount()
 })
 
 test('a session with nothing booked yet and no cost before it draws no bucket and no grey', async ($, on) => {

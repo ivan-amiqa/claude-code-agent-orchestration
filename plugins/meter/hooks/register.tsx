@@ -1318,6 +1318,31 @@ export function beforeLoaded(d: MeterData): number {
   return gap > 0.01 ? gap : 0
 }
 
+/**
+ * Each value's share of the total as legend text: `13%`, `<1%` for a non-zero share under 0.5%, `''` when
+ * the total is zero. Whole percents by largest remainder, so the shown ones (a `<1%` counts as 0) add up to 100.
+ */
+export function shares(values: number[]): string[] {
+  const vals = values.map(v => (Number.isFinite(v) && v > 0 ? v : 0))
+  const total = vals.reduce((sum, v) => sum + v, 0)
+  if (total <= 0) {
+    return values.map(() => '')
+  }
+  const exact = vals.map(v => (v / total) * 100)
+  const frac = exact.map(e => e - Math.floor(e + 1e-9))
+  const tiny = exact.map(e => e > 0 && e < 0.5)
+  const out = exact.map((e, i) => (tiny[i] ? 0 : Math.floor(e + 1e-9)))
+  const order = exact.flatMap((_, i) => (tiny[i] ? [] : [i])).sort((x, y) => (frac[y] ?? 0) - (frac[x] ?? 0) || x - y)
+  let left = 100 - out.reduce((sum, n) => sum + n, 0)
+  for (let n = 0; left > 0 && order.length > 0; n = (n + 1) % order.length, left--) {
+    const at = order[n] ?? 0
+    out[at] = (out[at] ?? 0) + 1
+  }
+
+  // a share rounded down to 0 that is not exactly 0 reads as `<1%`, still 0 in the sum
+  return out.map((n, i) => (n === 0 && (exact[i] ?? 0) > 0 ? '<1%' : `${n}%`))
+}
+
 const barLabel = (k: Kit, text: string) => {
   const { Text } = k
 
@@ -1341,25 +1366,31 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   const costItems: Item[] = [...(before > 0 ? [{ color: grey, value: before }] : []), ...shown.map(b => ({ color: tone(b), value: d.spend[b] }))]
   const tokenItems: Item[] = shown.map(b => ({ color: tone(b), value: d.written[b] }))
   // One legend under each bar, in the bar's own order: money under Cost, written tokens under Tokens written.
-  const costLegend: { color: Color; text: string }[] = [
-    ...(before > 0 ? [{ color: grey, text: `Before Meter loaded ≈${usd(before)}` }] : []),
-    ...shown.map(b => ({ color: tone(b), text: `${BUCKET_LABEL[b]} ≈${usd(d.spend[b])}` })),
-  ]
-  const tokenLegend: { color: Color; text: string }[] = shown.map(b => ({ color: tone(b), text: `${BUCKET_LABEL[b]} ${tokens(d.written[b])}` }))
+  type LegendEntry = { color: Color; text: string; pct?: string }
+  const costRows = [...(before > 0 ? [{ color: grey, text: `Before Meter loaded ≈${usd(before)}`, value: before }] : []), ...shown.map(b => ({ color: tone(b), text: `${BUCKET_LABEL[b]} ≈${usd(d.spend[b])}`, value: d.spend[b] }))]
+  const costShare = shares(costRows.map(r => r.value))
+  const costLegend: LegendEntry[] = costRows.map((r, i) => ({ color: r.color, text: r.text, pct: costShare[i] }))
+  const tokenShare = shares(shown.map(b => d.written[b]))
+  const tokenLegend: LegendEntry[] = shown.map((b, i) => ({ color: tone(b), text: `${BUCKET_LABEL[b]} ${tokens(d.written[b])}`, pct: tokenShare[i] }))
   const w = svgWidth(l)
   const stacked = (items: Item[], alt: string): RenderElement =>
     drawSvg(l, alt, w, BAR_HEIGHT, () => barSvg(items, l.palette, w)) ?? bar(k, splitParts(l.width, items))
   // 2 columns when an entry fits in half the width, else one per row.
   const half = Math.floor(l.width / 2)
   const twoCols = half >= 36
-  const entry = (e: { color: Color; text: string }, w?: number) => (
+  const entry = (e: LegendEntry, w?: number) => (
     <Box width={w} gap={1}>
       <Text color={e.color}>{'■'}</Text>
       <Text wrap="truncate-end">{e.text}</Text>
+      {e.pct ? (
+        <Text dimColor wrap="truncate-end">
+          {`· ${e.pct}`}
+        </Text>
+      ) : null}
     </Box>
   )
   const step = twoCols ? 2 : 1
-  const legendBox = (legend: { color: Color; text: string }[]): RenderElement => {
+  const legendBox = (legend: LegendEntry[]): RenderElement => {
     const rows: RenderElement[] = []
     for (let i = 0; i < legend.length; i += step) {
       rows.push(<Box>{legend.slice(i, i + step).map(e => entry(e, twoCols ? half : undefined))}</Box>)
