@@ -1,0 +1,6 @@
+{
+  "name": "ivan-amiqa",
+  "owner": { "name": "ivan-amiqa" },
+  "metadata": { "description": "Claude Code mods from the agent-orchestration talk repo" },
+  "plugins": [{ "name": "meter", "source": "./plugins/meter" }]
+}

@@ -4,6 +4,14 @@ A small, copyable setup for running [Claude Code](https://code.claude.com) as **
 
 From the talk *AI in the Wild: what it actually costs to build with it* (Digit, Tartu, 9 October 2026) by Iván Elorza Tahum.
 
+## Meter (cost meter mod)
+
+A Claude Code mod that shows, live next to your chat, what the session costs and who did the work: context size, cache countdown, cost by model and by sub-agent, dollars per step, GitHub checks. It also enforces two of the rules below (no nested agents; `Explore` and `general-purpose` don't inherit Opus). It uses zero model tokens. Details and honest caveats: [`plugins/meter/`](plugins/meter/README.md).
+
+```text
+/plugin install meter --marketplace ivan-amiqa/claude-code-agent-orchestration
+```
+
 ## Use it
 
 Copy the agent files into your project, or into your home folder to use them everywhere:
