@@ -29,7 +29,7 @@ Then run `/meter` to open the pane.
 | **Session cost** | Dollars so far, at list price |
 | **Context** | How many tokens every call re-reads, with the 350k and 500k marks |
 | **Cache** | A countdown to the prompt cache going cold (5 minute or 1 hour), reset on every call |
-| **Who did the work** | Cost and tokens written, split into Opus (main), Haiku, Sonnet and Opus (checks), plus one row per sub-agent: model, tokens read and written, cost, running or done |
+| **Who did the work** | Cost and tokens written, split into Opus (main), Haiku, Sonnet and Opus (checks), plus one row per agent type and model (runs added up): runs, tokens read and written, cost, running or done, most expensive first |
 | **GitHub** | The PRs this session opened, viewed or merged, with their state and check results |
 | **Dollars per step** | A column chart of main-conversation steps, each split into what was re-read from cache, what was newly stored, and the model's answer, with a mark where you ran `/compact` |
 | **Guard** | A line for every agent the mod blocked or switched |

@@ -1054,10 +1054,11 @@ export function barSvg(items: { color: string; value: number }[], pal: Palette, 
 
 const RING_SIZE = 28
 const RING_STROKE = 4
+const RING_LABEL_SIZE = 11
 
 /**
  * The cache countdown: a ring showing the fraction of the TTL left, or an empty track when there is no colour.
- * `label` (the minutes left, or a `×` when cold) is drawn inside it, small.
+ * `label` (the minutes left, or a `×` when cold) is drawn inside it, 11 px semi-bold, in the ring's colour.
  */
 export function ringSvg(fraction: number, color: string | undefined, pal: Palette, size = RING_SIZE, label?: string): string {
   const c = size / 2
@@ -1070,7 +1071,10 @@ export function ringSvg(fraction: number, color: string | undefined, pal: Palett
       `<circle cx="${px(c)}" cy="${px(c)}" r="${px(r)}" fill="none" stroke="${color}" stroke-width="${RING_STROKE}" stroke-linecap="round" stroke-dasharray="${px(length * f)} ${px(length)}" transform="rotate(-90 ${px(c)} ${px(c)})"/>`,
     )
   }
-  if (label !== undefined && label !== '') out.push(`<text x="${px(c)}" y="${px(c + 3.5)}" fill="${pal.text}" font-size="10" text-anchor="middle">${svgText(label)}</text>`)
+  // The label takes the ring's own state colour (no colour = the palette's text), and sits on the ring's centre line.
+  if (label !== undefined && label !== '') {
+    out.push(`<text x="${px(c)}" y="${px(c)}" fill="${color ?? pal.text}" font-size="${RING_LABEL_SIZE}" font-weight="600" text-anchor="middle" dominant-baseline="central">${svgText(label)}</text>`)
+  }
 
   return svgDoc(size, size, out.join(''))
 }
@@ -1258,6 +1262,36 @@ function cacheSection(k: Kit, l: Layout, d: MeterData): RenderElement {
 }
 
 // -- 4. Who did the work ----------------------------------------------------
+/** One row of the agent list: every run of one agent type on one model, added up. */
+export type AgentGroup = { name: string; model: string; bucket: MeterBucket; runs: number; read: number; written: number; usd: number; running: boolean; failed: number }
+
+/** Runs folded into one row per (type, model), most expensive first. The stored per-run rows are not touched. */
+export function groupAgents(agents: MeterAgent[]): AgentGroup[] {
+  const by = new Map<string, AgentGroup>()
+  for (const a of agents) {
+    const name = agentName(a.name)
+    const model = clean(a.model)
+    const key = `${name}\u0000${model}`
+    const g = by.get(key) ?? { name, model, bucket: a.bucket, runs: 0, read: 0, written: 0, usd: 0, running: false, failed: 0 }
+    g.runs += 1
+    g.read += a.read
+    g.written += a.written
+    g.usd += a.usd
+    if (a.status === 'running') g.running = true
+    if (a.status === 'failed') g.failed += 1
+    by.set(key, g)
+  }
+  return [...by.values()].sort((x, y) => y.usd - x.usd)
+}
+
+/** The row's text: `implementer · Sonnet · 3 runs · 12.5M read · 135k written · ≈$2.72` (a single run leaves out the runs part). */
+export function agentRowText(g: AgentGroup): string {
+  const runs = g.runs > 1 ? ` · ${g.runs} runs` : ''
+  const state = g.running ? ' · running' : g.failed === 0 ? '' : g.failed === g.runs ? ' · stopped' : ` · ${g.failed} stopped`
+
+  return `${g.name} · ${g.model}${runs} · ${tokens(g.read)} read · ${tokens(g.written)} written · ≈${usd(g.usd)}${state}`
+}
+
 type Item = { color: Color; value: number }
 
 /** Parts that cover `width` cells in proportion to the items, ending in the empty track. */
@@ -1327,7 +1361,8 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   for (let i = 0; i < legend.length; i += step) {
     legendRows.push(<Box>{legend.slice(i, i + step).map(e => entry(e, twoCols ? half : undefined))}</Box>)
   }
-  const recent = d.agents.slice(-8)
+  const groups = groupAgents(d.agents)
+  const recent = groups.slice(0, 8)
 
   return section(
     k,
@@ -1344,14 +1379,11 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
     </Box>,
     <Box flexDirection="column" marginTop={1}>
       {d.agents.length === 0 ? caption(k, 'no agents yet') : null}
-      {d.agents.length > recent.length ? caption(k, `${d.agents.length - recent.length} earlier agents not shown`) : null}
-      {recent.map(a => (
+      {groups.length > recent.length ? caption(k, `${groups.length - recent.length} more agent types not shown`) : null}
+      {recent.map(g => (
         <Box gap={1}>
-          <Text color={tone(a.bucket)}>{'●'}</Text>
-          <Text>
-            {agentName(a.name)} {'·'} {clean(a.model)} {'·'} {tokens(a.read)} read {'·'} {tokens(a.written)} written {'·'} ≈{usd(a.usd)}
-            {a.status === 'running' ? ' · running' : a.status === 'failed' ? ' · stopped' : ''}
-          </Text>
+          <Text color={tone(g.bucket)}>{'●'}</Text>
+          <Text>{agentRowText(g)}</Text>
         </Box>
       ))}
     </Box>,

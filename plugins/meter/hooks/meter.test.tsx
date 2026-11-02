@@ -5,7 +5,7 @@ import type { On } from 'claude-code'
 
 import type { MeterData, MeterGroup, MeterPr } from '../types'
 
-import { addToGroups, barSvg, beforeLoaded, columnColors, dollarsSvg, esc, gaugeSvg, labelRow, labelStart, mergePairs, niceTicks, niceTop, PALETTES, paletteFor, PRICE_RATIO, prUrlsIn, ringSvg, rollup, sane, sanePrs, splitCost, splitParts, stackCells, tokens, truncate } from './register'
+import { addToGroups, agentRowText, barSvg, beforeLoaded, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, niceTicks, niceTop, PALETTES, paletteFor, PRICE_RATIO, prUrlsIn, ringSvg, rollup, sane, sanePrs, splitCost, splitParts, stackCells, tokens, truncate } from './register'
 
 const PANE = {
   plugin: 'meter',
@@ -1644,6 +1644,75 @@ test('the cache ring shows the fraction of the TTL left', () => {
   expect(arc(Number.NaN)).toBeUndefined()
 })
 
+test('the cache ring label takes the state colour of every palette, text colour when there is no state colour', () => {
+  for (const pal of [PALETTES.light, PALETTES.dark, PALETTES.neutral]) {
+    for (const hex of [pal.ok, pal.warn, pal.bad]) {
+      const t = elements(ringSvg(0.5, hex, pal, undefined, '9'), 'text')[0]
+      expect(t?.fill).toBe(hex)
+      expect(num(t?.['font-size'])).toBeGreaterThanOrEqual(11)
+      expect(num(t?.['font-size'])).toBeLessThanOrEqual(12)
+    }
+    expect(elements(ringSvg(0.5, undefined, pal, undefined, '9'), 'text')[0]?.fill).toBe(pal.text)
+  }
+})
+
+const agentRun = (id: string, name: string, model: string, bucket: 'haiku' | 'sonnet' | 'opus-checks', read: number, written: number, usd: number, status: 'running' | 'done' | 'failed' = 'done') =>
+  ({ id, name, model, bucket, read, written, usd, status, startedAt: NOW - 20 * MIN, endedAt: status === 'running' ? null : NOW - 10 * MIN, warned: false })
+
+test('agent runs fold into one row per type and model, with summed tokens and dollars', () => {
+  const rows = groupAgents([
+    agentRun('i1', 'implementer', 'Sonnet', 'sonnet', 5_000_000, 50_000, 1.2),
+    agentRun('s1', 'scout', 'Haiku', 'haiku', 40_000, 900, 0.06),
+    agentRun('i2', 'implementer', 'Sonnet', 'sonnet', 4_500_000, 45_000, 1.0),
+    agentRun('i3', 'implementer', 'Sonnet', 'sonnet', 3_000_000, 40_000, 0.52),
+  ])
+  expect(rows.map(r => `${r.name}/${r.model}/${r.runs}`)).toEqual(['implementer/Sonnet/3', 'scout/Haiku/1'])
+  expect(agentRowText(rows[0] as never)).toBe('implementer · Sonnet · 3 runs · 12.5M read · 135k written · ≈$2.72')
+  expect(agentRowText(rows[1] as never)).toBe('scout · Haiku · 40k read · 900 written · ≈$0.06') // one run: no runs part
+})
+
+test('the same agent type on two models stays two rows; a running run marks its row; rows sort by dollars', () => {
+  const rows = groupAgents([
+    agentRun('v1', 'verifier', 'Sonnet', 'sonnet', 100_000, 5_000, 0.3),
+    agentRun('v2', 'verifier', 'Opus', 'opus-checks', 200_000, 9_000, 1.5, 'running'),
+    agentRun('v3', 'verifier', 'Opus', 'opus-checks', 100_000, 1_000, 0.5),
+    agentRun('x1', 'scout', 'Haiku', 'haiku', 1_000, 10, 0.9, 'failed'),
+  ])
+  expect(rows.map(r => `${r.name}/${r.model}`)).toEqual(['verifier/Opus', 'scout/Haiku', 'verifier/Sonnet'])
+  expect(rows.map(r => r.usd)).toEqual([2, 0.9, 0.3])
+  expect(agentRowText(rows[0] as never)).toMatch(/verifier · Opus · 2 runs · .* · ≈\$2\.00 · running$/)
+  expect(agentRowText(rows[1] as never)).toMatch(/ · stopped$/)
+  expect(agentRowText(rows[2] as never)).not.toMatch(/running|stopped/)
+  // A partly failed group says how many stopped, and a control character in a name never reaches the row.
+  const mixed = groupAgents([agentRun('m1', 'a\u001bb', 'Opus', 'opus-checks', 1, 1, 1, 'failed'), agentRun('m2', 'a\u001bb', 'Opus', 'opus-checks', 1, 1, 1)])
+  expect(agentRowText(mixed[0] as never)).toBe('a b · Opus · 2 runs · 2 read · 2 written · ≈$2.00 · 1 stopped')
+})
+
+test('the pane draws one row per agent type and model, on terminal and desktop', async ($, on) => {
+  on(
+    'state.get',
+    (_, e) =>
+      stored(
+        live({
+          agents: [
+            agentRun('i1', 'implementer', 'Sonnet', 'sonnet', 5_000_000, 50_000, 1.2),
+            agentRun('s1', 'scout', 'Haiku', 'haiku', 40_000, 900, 0.06),
+            agentRun('i2', 'implementer', 'Sonnet', 'sonnet', 4_500_000, 45_000, 1.0),
+            agentRun('i3', 'implementer', 'Sonnet', 'sonnet', 3_000_000, 40_000, 0.52, 'running'),
+          ],
+        }),
+        e,
+      ) as never,
+  )
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: /implementer · Sonnet · 3 runs · 12\.5M read · 135k written · ≈\$2\.72 · running/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /scout · Haiku · 40k read · 900 written · ≈\$0\.06/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /implementer · Sonnet · 5\.0M read/ })).toBeUndefined() // no per-run row
+    await ui.unmount()
+  }
+})
+
 test('the cache ring is 28 px with a 4 px stroke and the minutes left inside it', () => {
   const src = ringSvg(0.5, '#55A06A', PALETTES.light, undefined, '41')
   expect(src).toContain('width="28" height="28" viewBox="0 0 28 28"')
@@ -1651,8 +1720,12 @@ test('the cache ring is 28 px with a 4 px stroke and the minutes left inside it'
   expect(elements(src, 'circle')[0]?.r).toBe('11')
   const text = elements(src, 'text')
   expect(text).toHaveLength(1)
-  expect(text[0]?.['font-size']).toBe('10')
+  expect(text[0]?.['font-size']).toBe('11')
+  expect(text[0]?.['font-weight']).toBe('600')
+  expect(text[0]?.fill).toBe('#55A06A') // the ring's own state colour, not the palette's text
+  expect(text[0]?.['dominant-baseline']).toBe('central')
   expect(text[0]?.['text-anchor']).toBe('middle')
+  expect(text[0]?.y).toBe('14')
   expect(text[0]?.x).toBe('14')
   expect(src).toContain('>41<')
   // no label, no text; a label is cleaned and escaped like any SVG text
