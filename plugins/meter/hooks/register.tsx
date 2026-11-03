@@ -920,6 +920,9 @@ const roundedTop = (x: number, y: number, w: number, h: number, r: number): stri
 }
 
 const DOLLARS_HEIGHT = 180
+/** The chart in the docked pane (narrower than EXPANDED_FROM cells) is a quarter shorter; the expanded one keeps the full height. */
+const DOLLARS_HEIGHT_DOCKED = 135
+const EXPANDED_FROM = 72
 const COLUMN_MAX_PX = 36 // a column is never wider than this (the pitch is a third wider)
 const GAP_SHARE = 0.25 // of the pitch
 const COMPACT_PILL = '/compact'
@@ -1193,75 +1196,96 @@ function drawSvg(l: Layout, alt: string, width: number, height: number, build: (
   }
 }
 
-// -- 1. Session cost --------------------------------------------------------
-function costSection(k: Kit, d: MeterData): RenderElement {
-  return section(k, 'Session cost', big(k, usd(d.costUsd)), caption(k, 'this session · list price'))
-}
-
-// -- 2. Context -------------------------------------------------------------
+// -- 1-3. Session cost, Context, Cache: three tiles in a row, the gauge under them --
 const GAUGE_MAX = 600_000
-function contextSection(k: Kit, l: Layout, d: MeterData): RenderElement {
+/** Below this many cells a tile would be too narrow for its big number: the three stack instead. */
+const TILES_MIN = 36
+
+/** The context gauge bar with its 350k / 500k ticks: full width, SVG or cells. */
+function contextGauge(k: Kit, l: Layout, d: MeterData): RenderElement {
   const { Box, Text } = k
   const zone = contextZone(d.contextTokens)
   const w = svgWidth(l)
   const drawn = drawSvg(l, `Context ${tokens(d.contextTokens)} of ${tokens(GAUGE_MAX)}, marks at 350k and 500k`, w, GAUGE_HEIGHT, () => gaugeSvg(d.contextTokens, l.palette, w))
-  let gauge: RenderElement
-  if (drawn !== undefined) gauge = drawn
-  else {
-    const at = (n: number) => clamp(Math.round((n / GAUGE_MAX) * l.width), 0, l.width - 1)
-    const fill = clamp(Math.round((d.contextTokens / GAUGE_MAX) * l.width), 0, l.width)
-    const marks = [
-      { at: at(WARN_AT), text: '350k' },
-      { at: at(BAD_AT), text: '500k' },
-    ]
-    gauge = (
-      <Box flexDirection="column">
-        {bar(k, gaugeParts(l.width, fill, zone, [at(WARN_AT), at(BAD_AT)]))}
-        <Text mono dimColor>
-          {labelRow(l.width, marks)}
-        </Text>
-      </Box>
-    )
-  }
+  if (drawn !== undefined) return drawn
+  const at = (n: number) => clamp(Math.round((n / GAUGE_MAX) * l.width), 0, l.width - 1)
+  const fill = clamp(Math.round((d.contextTokens / GAUGE_MAX) * l.width), 0, l.width)
+  const marks = [
+    { at: at(WARN_AT), text: '350k' },
+    { at: at(BAD_AT), text: '500k' },
+  ]
 
-  return section(k, 'Context', big(k, tokens(d.contextTokens), zone), caption(k, 'every call re-reads this'), gauge)
+  return (
+    <Box flexDirection="column">
+      {bar(k, gaugeParts(l.width, fill, zone, [at(WARN_AT), at(BAD_AT)]))}
+      <Text mono dimColor>
+        {labelRow(l.width, marks)}
+      </Text>
+    </Box>
+  )
 }
 
-// -- 3. Cache ---------------------------------------------------------------
 // A ring countdown in one glyph: full, three quarters, half, quarter, empty.
 const ring = (fraction: number) =>
   fraction > 0.875 ? '●' : fraction > 0.625 ? '◕' : fraction > 0.375 ? '◑' : fraction > 0.05 ? '◔' : '○'
 
-function cacheSection(k: Kit, l: Layout, d: MeterData): RenderElement {
+/** The cache tile's body: the ring and the state word, then the minutes left and the TTL (as one short muted line each). */
+function cacheTile(k: Kit, l: Layout, d: MeterData): RenderElement[] {
   const { Box, Text } = k
   const c = cacheInfo(d)
   const color = c.state === 'warm' ? OK : c.state === 'cooling' ? WARN : c.state === 'cold' ? BAD : undefined
   const ringHex = c.state === 'warm' ? l.palette.ok : c.state === 'cooling' ? l.palette.warn : c.state === 'cold' ? l.palette.bad : undefined
   const fraction = clamp(c.leftMs / TTL_MS[d.cacheTtl], 0, 1)
-  const drawn = drawSvg(l, `Cache ${c.state === 'none' ? 'no call yet' : c.state}${c.state === 'warm' || c.state === 'cooling' ? `, ${leftLong(c.leftMs)}` : ''}`, RING_SIZE, RING_SIZE, () => ringSvg(fraction, ringHex, l.palette, RING_SIZE, c.state === 'warm' || c.state === 'cooling' ? String(Math.max(1, Math.ceil(c.leftMs / MIN))) : c.state === 'cold' ? '×' : undefined))
-  const line =
-    c.state === 'none'
-      ? 'no call yet'
-      : c.state === 'cold'
-        ? `cold — next call re-writes ${tokens(d.contextTokens)}.${d.contextTokens > FRESH_AT ? ' A fresh session is cheaper.' : ''}`
-        : `${c.state} · ${leftLong(c.leftMs)}`
-  const ttl = d.cacheTtl === '1h' ? '1 hour' : '5 minute'
-  const source = d.cacheTtlSource === 'assumed' ? ' (assumed)' : d.cacheTtlSource === 'observed' ? ' (observed)' : ''
+  const live = c.state === 'warm' || c.state === 'cooling'
+  const drawn = drawSvg(l, `Cache ${c.state === 'none' ? 'no call yet' : c.state}${live ? `, ${leftLong(c.leftMs)}` : ''}`, RING_SIZE, RING_SIZE, () => ringSvg(fraction, ringHex, l.palette, RING_SIZE, live ? String(Math.max(1, Math.ceil(c.leftMs / MIN))) : c.state === 'cold' ? '×' : undefined))
+  const word = c.state === 'none' ? 'no call' : c.state
+  const ttl = d.cacheTtlSource === 'assumed' ? `${d.cacheTtl} · assumed` : d.cacheTtlSource === 'observed' ? `${d.cacheTtl} · observed` : `${d.cacheTtl} cache`
 
-  return section(
-    k,
-    'Cache',
+  return [
     <Box gap={1} alignItems="center">
       {drawn ?? (
         <Text size="title" color={color}>
           {ring(fraction)}
         </Text>
       )}
-      <Text color={color} weight="semibold">
-        {line}
+      <Text color={color} weight="semibold" wrap="truncate-end">
+        {word}
       </Text>
     </Box>,
-    caption(k, `${ttl} cache${source}, resets on every call`),
+    live ? caption(k, leftLong(c.leftMs)) : null,
+    caption(k, ttl),
+  ].flatMap(x => (x === null ? [] : [x]))
+}
+
+function topSection(k: Kit, l: Layout, d: MeterData): RenderElement {
+  const { Box, Text } = k
+  const side = l.width >= TILES_MIN
+  const tileW = Math.floor(l.width / 3)
+  const tile = (title: string, ...body: RenderElement[]): RenderElement => (
+    <Box flexDirection="column" width={side ? tileW : undefined}>
+      <Text weight="bold" wrap="truncate-end">
+        {title}
+      </Text>
+      {body}
+    </Box>
+  )
+  const c = cacheInfo(d)
+  const tiles = [
+    tile('Session cost', big(k, usd(d.costUsd)), caption(k, 'list price')),
+    tile('Context', big(k, tokens(d.contextTokens), contextZone(d.contextTokens)), caption(k, 'read each call')),
+    tile('Cache', ...cacheTile(k, l, d)),
+  ]
+
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      {side ? <Box width={l.width}>{tiles}</Box> : <Box flexDirection="column" gap={1}>{tiles}</Box>}
+      {contextGauge(k, l, d)}
+      {c.state === 'cold' ? (
+        <Text size="caption" color={BAD}>
+          {`cold — next call re-writes ${tokens(d.contextTokens)}.${d.contextTokens > FRESH_AT ? ' A fresh session is cheaper.' : ''}`}
+        </Text>
+      ) : null}
+    </Box>
   )
 }
 
@@ -1288,12 +1312,24 @@ export function groupAgents(agents: MeterAgent[]): AgentGroup[] {
   return [...by.values()].sort((x, y) => y.usd - x.usd)
 }
 
-/** The row's text: `implementer · Sonnet · 3 runs · 12.5M read · 135k written · ≈$2.72` (a single run leaves out the runs part). */
-export function agentRowText(g: AgentGroup): string {
-  const runs = g.runs > 1 ? ` · ${g.runs} runs` : ''
-  const state = g.running ? ' · running' : g.failed === 0 ? '' : g.failed === g.runs ? ' · stopped' : ` · ${g.failed} stopped`
+/**
+ * One agent row as three parts: `implementer ×2 · Sonnet` (a single run leaves out the `×`; a run in progress or
+ * stopped says so after the model), `12.5M / 135k` (read / written) and `≈$2.72`. `room` is the row's width in
+ * characters: only the NAME is cut (with …) to fit it, never the model, the state, the tokens or the dollars.
+ * The state is a word (` · running`, ` · stopped`, ` · 2 stopped`) or, with `words` off, a glyph as the PR rows
+ * use (` ▶`, ` ✕`, ` ✕2`); `cut` says the name did not fit with the words, so the pane asks again with glyphs.
+ */
+export function agentRow(g: AgentGroup, room: number, words = true): { left: string; io: string; cost: string; cut: boolean } {
+  const runs = g.runs > 1 ? ` ×${g.runs}` : ''
+  const state = words
+    ? g.running ? ' · running' : g.failed === 0 ? '' : g.failed === g.runs ? ' · stopped' : ` · ${g.failed} stopped`
+    : g.running ? ' ▶' : g.failed === 0 ? '' : g.failed === g.runs ? ' ✕' : ` ✕${g.failed}`
+  const io = `${tokens(g.read)} / ${tokens(g.written)}`
+  const cost = `≈${usd(g.usd)}`
+  // dot + gap in front, a gap before the tokens and one before the dollars
+  const budget = room - (2 + runs.length + ` · ${g.model}${state}`.length + io.length + cost.length + 2)
 
-  return `${g.name} · ${g.model}${runs} · ${tokens(g.read)} read · ${tokens(g.written)} written · ≈${usd(g.usd)}${state}`
+  return { left: `${truncate(g.name, Math.max(4, budget))}${runs} · ${g.model}${state}`, io, cost, cut: g.name.length > Math.max(4, budget) }
 }
 
 type Item = { color: Color; value: number }
@@ -1357,6 +1393,10 @@ const barLabel = (k: Kit, text: string) => {
   )
 }
 
+/** One row of the shared legend: a bucket's cost and its tokens written, each with its share of its own bar. */
+export type LegendRow = { color: Color; name: string; cost: string; costPct: string; tokens: string; tokensPct: string }
+const NO_TOKENS = '—'
+
 function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   const { Box, Text } = k
   const before = beforeLoaded(d)
@@ -1369,45 +1409,74 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   const grey: Color = svgOn ? l.palette.before : GREY
   const costItems: Item[] = [...(before > 0 ? [{ color: grey, value: before }] : []), ...shown.map(b => ({ color: tone(b), value: d.spend[b] }))]
   const tokenItems: Item[] = shown.map(b => ({ color: tone(b), value: d.written[b] }))
-  // One legend under each bar, in the bar's own order: money under Cost, written tokens under Tokens written.
-  type LegendEntry = { color: Color; text: string; pct?: string }
-  const costRows = [...(before > 0 ? [{ color: grey, text: `Before Meter loaded ≈${usd(before)}`, value: before }] : []), ...shown.map(b => ({ color: tone(b), text: `${BUCKET_LABEL[b]} ≈${usd(d.spend[b])}`, value: d.spend[b] }))]
+  // One legend for both bars, in the Cost bar's order: money first, then the tokens written. What was
+  // counted before this mod loaded has money but no tokens (`—`), and is not part of the tokens' 100%.
+  const costRows = [...(before > 0 ? [{ color: grey, name: 'Before Meter loaded', value: before, bucket: undefined }] : []), ...shown.map(b => ({ color: tone(b), name: BUCKET_LABEL[b], value: d.spend[b], bucket: b }))]
   const costShare = shares(costRows.map(r => r.value))
-  const costLegend: LegendEntry[] = costRows.map((r, i) => ({ color: r.color, text: r.text, pct: costShare[i] }))
   const tokenShare = shares(shown.map(b => d.written[b]))
-  const tokenLegend: LegendEntry[] = shown.map((b, i) => ({ color: tone(b), text: `${BUCKET_LABEL[b]} ${tokens(d.written[b])}`, pct: tokenShare[i] }))
+  const legend: LegendRow[] = costRows.map((r, i) => {
+    const at = r.bucket === undefined ? -1 : shown.indexOf(r.bucket)
+
+    return {
+      color: r.color,
+      name: r.name,
+      cost: `≈${usd(r.value)}`,
+      costPct: costShare[i] ?? '',
+      tokens: r.bucket === undefined ? NO_TOKENS : tokens(d.written[r.bucket]),
+      tokensPct: r.bucket === undefined ? NO_TOKENS : (tokenShare[at] ?? ''),
+    }
+  })
   const w = svgWidth(l)
   const stacked = (items: Item[], alt: string): RenderElement =>
     drawSvg(l, alt, w, BAR_HEIGHT, () => barSvg(items, l.palette, w)) ?? bar(k, splitParts(l.width, items))
-  // 2 columns when an entry fits in half the width, else one per row.
-  const half = Math.floor(l.width / 2)
-  const twoCols = half >= 36
-  const entry = (e: LegendEntry, w?: number) => (
-    <Box width={w} gap={1}>
-      <Text color={e.color}>{'■'}</Text>
-      <Text wrap="truncate-end">{e.text}</Text>
-      {e.pct ? (
-        <Text dimColor wrap="truncate-end">
-          {`· ${e.pct}`}
-        </Text>
-      ) : null}
+
+  // Number columns are as wide as their widest entry (and a gap); the name takes the rest.
+  const widest = (pick: (r: LegendRow) => string) => Math.max(0, ...legend.map(r => pick(r).length)) + 1
+  const costW = widest(r => r.cost)
+  const costPctW = Math.max(widest(r => r.costPct), 'Cost'.length + 1 - costW)
+  const tokW = widest(r => r.tokens)
+  const tokPctW = Math.max(widest(r => r.tokensPct), 'Written'.length + 1 - tokW)
+  const nameW = Math.max(8, l.width - costW - costPctW - tokW - tokPctW)
+  const cell = (width: number, text: string, dim = false): RenderElement => (
+    <Box width={width} justifyContent="flex-end">
+      <Text dimColor={dim}>{text}</Text>
     </Box>
   )
-  const step = twoCols ? 2 : 1
-  const legendBox = (legend: LegendEntry[]): RenderElement => {
-    const rows: RenderElement[] = []
-    for (let i = 0; i < legend.length; i += step) {
-      rows.push(<Box>{legend.slice(i, i + step).map(e => entry(e, twoCols ? half : undefined))}</Box>)
-    }
-
-    return (
+  const head = (width: number, text: string): RenderElement => (
+    <Box width={width} justifyContent="flex-end">
+      {caption(k, text)}
+    </Box>
+  )
+  const table =
+    legend.length === 0 ? null : (
       <Box flexDirection="column" marginTop={1}>
-        {rows}
+        <Box width={l.width}>
+          <Box width={nameW} />
+          {head(costW + costPctW, 'Cost')}
+          {head(tokW + tokPctW, 'Written')}
+        </Box>
+        {legend.map(r => (
+          <Box width={l.width}>
+            <Box width={nameW} gap={1}>
+              <Text color={r.color}>{'■'}</Text>
+              <Text wrap="truncate-end">{truncate(r.name, nameW - 2)}</Text>
+            </Box>
+            {cell(costW, r.cost)}
+            {cell(costPctW, r.costPct, true)}
+            {cell(tokW, r.tokens)}
+            {cell(tokPctW, r.tokensPct, true)}
+          </Box>
+        ))}
       </Box>
     )
-  }
+
   const groups = groupAgents(d.agents)
   const recent = groups.slice(0, 8)
+  // The state reads as words while every name fits with them; one cut name and all rows use the glyph.
+  const asWords = recent.map(g => agentRow(g, l.width))
+  const rows = (asWords.some(r => r.cut) ? recent.map(g => agentRow(g, l.width, false)) : asWords).map((r, i) => ({ g: recent[i] as AgentGroup, ...r }))
+  const ioW = Math.max('read / written'.length, ...rows.map(r => r.io.length))
+  const costColW = Math.max(...rows.map(r => r.cost.length), 1)
 
   return section(
     k,
@@ -1415,19 +1484,33 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
     caption(k, '≈ split of the session total by step · tokens exact'),
     barLabel(k, 'Cost'),
     stacked(costItems, `Cost by who did the work, total ${usd(d.costUsd)}`),
-    legendBox(costLegend),
     <Box marginTop={1} flexDirection="column">
       {barLabel(k, 'Tokens written')}
       {stacked(tokenItems, 'Tokens written by who did the work')}
     </Box>,
-    legendBox(tokenLegend),
+    table,
     <Box flexDirection="column" marginTop={1}>
       {d.agents.length === 0 ? caption(k, 'no agents yet') : null}
       {groups.length > recent.length ? caption(k, `${groups.length - recent.length} more agent types not shown`) : null}
-      {recent.map(g => (
-        <Box gap={1}>
-          <Text color={tone(g.bucket)}>{'●'}</Text>
-          <Text>{agentRowText(g)}</Text>
+      {rows.length === 0 ? null : (
+        <Box width={l.width} justifyContent="space-between">
+          {caption(k, 'agent · model')}
+          <Box gap={1}>
+            {head(ioW, 'read / written')}
+            {head(costColW, '≈$')}
+          </Box>
+        </Box>
+      )}
+      {rows.map(r => (
+        <Box width={l.width} justifyContent="space-between">
+          <Box gap={1}>
+            <Text color={tone(r.g.bucket)}>{'●'}</Text>
+            <Text wrap="truncate-end">{r.left}</Text>
+          </Box>
+          <Box gap={1}>
+            {cell(ioW, r.io, true)}
+            {cell(costColW, r.cost)}
+          </Box>
         </Box>
       ))}
     </Box>,
@@ -1690,7 +1773,8 @@ function dollarsSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   const w = svgWidth(l)
   const peak = Math.max(...groups.map(g => g.readUsd + g.newUsd + g.answerUsd))
   const alt = `Dollars per step: ${groups.length} column${groups.length === 1 ? '' : 's'} of main-conversation steps ${groups[0]?.fromStep ?? 1} to ${lastStep(d)}, tallest ${dollars(peak)}${markAt >= 0 ? `, /compact before step ${groups[markAt]?.fromStep ?? ''}` : ''}`
-  const drawn = drawSvg(l, alt, w, DOLLARS_HEIGHT, () => dollarsSvg(groups, markAt, l.palette, w))
+  const height = l.width < EXPANDED_FROM ? DOLLARS_HEIGHT_DOCKED : DOLLARS_HEIGHT
+  const drawn = drawSvg(l, alt, w, height, () => dollarsSvg(groups, markAt, l.palette, w, height))
   if (drawn !== undefined) return section(k, title, sub, drawn, legendRow)
 
   // No `Svg` (the terminal), or it could not be built: cells of text blocks.
@@ -1777,11 +1861,12 @@ function dollarsSection(k: Kit, l: Layout, d: MeterData): RenderElement {
 // -- 7. Guard ---------------------------------------------------------------
 function guardSection(k: Kit, d: MeterData): RenderElement {
   const { Box, Text } = k
+  // nothing to report: one muted line, not a title and a body
+  if (d.guardLines.length === 0) return <Box marginTop={1}>{caption(k, 'Guard · nothing blocked yet')}</Box>
 
   return section(
     k,
     'Guard',
-    d.guardLines.length === 0 ? caption(k, 'nothing blocked or switched yet') : null,
     ...d.guardLines.map(g => (
       <Box gap={1}>
         <Text color={g.kind === 'blocked' ? BAD : WARN}>{'●'}</Text>
@@ -1871,9 +1956,7 @@ export const register: Register = (on, options) => {
 
       return (
         <Box flexDirection="column" paddingX={1}>
-          {costSection(k, d)}
-          {contextSection(k, layout, d)}
-          {cacheSection(k, layout, d)}
+          {topSection(k, layout, d)}
           {workSection(k, layout, d)}
           {ciSection(k, layout, ci)}
           {dollarsSection(k, layout, d)}
