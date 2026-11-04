@@ -18,12 +18,13 @@ When a sub-agent returns a question instead of a result, answer it and dispatch 
 
 ### Guard hooks (optional)
 
-Two hooks in `.claude/hooks/` back these rules up; `.claude/settings.json` wires them in.
+Three hooks in `.claude/hooks/` back these rules up; `.claude/settings.json` wires them in.
 
 - `delegation-guard.sh` **reminds** after 6 code-reading calls with no `scout`/`log-digger` call, after 4 code edits with no `implementer` call, and on `gh pr create`/`merge` with no `verifier` started since the last code change. It **blocks** a PR merge (`gh pr merge`, `gh api …/pulls/N/merge`, enabling auto-merge) unless `pr-reviewer` was started on that PR after the last code change. A reminder means you are already past the rule, not that the rule starts there.
 - It only knows the reviewer was *started*, not what it concluded. Read the verdict before you merge.
 - If the PR was reviewed some other way (a teammate's review, another session), or you are merging your own work without review, say so in the command and the merge goes through: `gh pr merge 123 … # reviewed-by: teammate review in PR comments`.
 - `worktree-guard.sh` never blocks. Before a state-changing `git`/`gh` command it prints which repo and branch the command will hit, so a wrong checkout is noticed before the damage.
+- `context-size-guard.sh` never blocks. When the main session's context passes 350k tokens it says so once; at 500k it recommends `/compact` or a fresh session. Every call re-reads the whole context, so its size is the cost of every step. Thresholds: `CONTEXT_WARN_1`, `CONTEXT_WARN_2`.
 
 ## Verify, don't assume
 
