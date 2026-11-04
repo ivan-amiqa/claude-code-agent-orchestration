@@ -1,4 +1,10 @@
 {
+  "permissions": {
+    "deny": [
+      "mcp__ccd_session__start_session",
+      "mcp__ccd_session__hand_off_to_session"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
