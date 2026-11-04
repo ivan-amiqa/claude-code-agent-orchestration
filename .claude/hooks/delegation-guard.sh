@@ -10,12 +10,22 @@
 #   verify   - a verifier start with no code edit since
 #
 # Reminds (never blocks) for scout/log-digger, implementer and verifier.
-# BLOCKS a PR merge (`gh pr merge`, `gh api .../pulls/N/merge`, including
-# `gh pr merge --auto`) unless pr-reviewer was started on that PR after the last
-# code edit, or the command carries an escape hatch:
+# BLOCKS a PR merge unless pr-reviewer was started on that PR after the last
+# code edit, or the command carries an escape hatch. It catches an unquoted
+# `gh pr merge` (any flags, so `--auto` too) or `gh api .../pulls/N/merge` in a Bash
+# command. Quoted or wrapped forms (`sh -c '...'`, a quoted API path, `"gh"`) are
+# not seen, and neither are other ways to merge or to enable auto-merge: the desktop
+# app's own tool (`mcp__ccd_pr__set_auto_merge`), a GraphQL `enablePullRequestAutoMerge`
+# call, or the GitHub web UI. It is a guardrail against forgetting, not a security
+# boundary. The escape hatch:
 #     gh pr merge 123 ...  # reviewed-by: teammate review in PR comments
 # The hook only knows the reviewer was STARTED, not what it concluded: read the
-# verdict before you merge. Always exits 0 (a block is a "deny" JSON, not an error),
+# verdict before you merge. Fails CLOSED for merges: if the session id is not plain,
+# or the per-user state folder cannot be created, is a symlink, or is owned by someone
+# else (a planted folder on a shared /tmp), it is refused and the guard cannot know the
+# review state, so a merge command is denied (even with the
+# reviewed-by hatch) with a reason saying so; every other call exits 0 silently.
+# Always exits 0 (a block is a "deny" JSON, not an error),
 # except the jq-missing fallback below, which refuses merges with exit 2.
 #
 # Configuration (environment variables, all optional):
@@ -26,7 +36,8 @@
 #                                 Default: docs/*:*/docs/*:memory/*:*/memory/*
 #                                 (your docs and notes folders). Add your own, e.g.
 #                                 DELEGATION_GUARD_IGNORE_GLOB='docs/*:*/docs/*:*/wiki/*'
-#   TMPDIR                        where per-session counters live (default /tmp)
+#   TMPDIR                        where per-session counters live (default /tmp), in a
+#                                 per-user folder claude-delegation-<uid> (mode 0700)
 # To turn the guard off: remove its entry from .claude/settings.json.
 
 READ_LIMIT="${DELEGATION_GUARD_READ_LIMIT:-6}"
@@ -48,12 +59,32 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 j() { printf '%s' "$input" | jq -r "$1 // empty" 2>/dev/null; }
 
-sid=$(j .session_id); [ -z "$sid" ] && exit 0
+sid=$(j .session_id)
 tool=$(j .tool_name)
 in_subagent=$([ -n "$(j .agent_id)" ] && echo 1)
-dir="${TMPDIR:-/tmp}/claude-delegation/$sid"; mkdir -p "$dir"
-get() { cat "$dir/$1" 2>/dev/null || echo 0; }
-put() { echo "$2" > "$dir/$1"; }
+# State is unusable (bad="1") if the session id is not plain (it goes into a path) or the
+# per-user folder cannot be made or is not ours. Then nothing is created or written, and
+# only a merge command is acted on (denied, below).
+bad=""
+case "$sid" in ""|*[!A-Za-z0-9_-]*) bad=1 ;; esac
+if [ -z "$bad" ]; then
+  # Per-user state folder, not readable or writable by other users.
+  umask 077
+  base="${TMPDIR:-/tmp}/claude-delegation-$(id -u)"
+  mkdir -p -m 700 "$base" 2>/dev/null || bad=1
+  # Refuse a symlinked, missing or foreign-owned folder (mkdir -p and -O both follow symlinks).
+  [ -z "$bad" ] && { [ -L "$base" ] || [ ! -d "$base" ] || [ ! -O "$base" ]; } && bad=1
+  if [ -z "$bad" ]; then
+    chmod 700 "$base" 2>/dev/null
+    dir="$base/$sid"
+    mkdir -p "$dir" 2>/dev/null || bad=1
+    [ -z "$bad" ] && { [ -L "$dir" ] || [ ! -d "$dir" ] || [ ! -O "$dir" ]; } && bad=1
+  fi
+fi
+[ -n "$bad" ] && [ "$tool" != Bash ] && exit 0
+# Counters are read back into shell arithmetic: anything but digits counts as 0.
+get() { [ -n "$bad" ] && { echo 0; return; }; local v; v=$(cat "$dir/$1" 2>/dev/null); case "$v" in ""|*[!0-9]*) v=0 ;; esac; echo "$v"; }
+put() { [ -n "$bad" ] && return 0; echo "$2" > "$dir/$1"; }
 msgs=()
 
 # True if the path matches one of the ignore globs (colon-separated, see header).
@@ -148,6 +179,7 @@ merge_target() {
 }
 
 merge_gate() {   # $1 = text naming the PR (the command), $2 = text that may carry the hatch
+  [ -n "$bad" ] && deny "[delegation-guard] Merge blocked: the guard could not verify review state (the session id is not plain, or its per-user state folder under \${TMPDIR:-/tmp} could not be created, is a symlink, or is not owned by you). Fix that, or merge from the GitHub UI."
   hatch=$(printf '%s' "$2" | grep -oE '#[[:space:]]*reviewed-by:[[:space:]]*[^[:space:]].{7,}' | head -1)
   [ -n "$hatch" ] && return 0
   rev=$(cat "$dir/reviewed" 2>/dev/null)
@@ -176,10 +208,11 @@ case "$tool" in
       merge_gate "$cmd" "$hatchsrc"
     fi
     if printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_-])gh([[:space:]][^;&|]*)?[[:space:]]pr[[:space:]]+(create|merge)' && [ "$(get verify)" != 1 ] && [ -z "$in_subagent" ]; then
-      msgs+=("[delegation-guard] No verifier run since the last code change. CLAUDE.md: before declaring done -> verifier (fresh context, can contradict you). Run it before you report this as done.")
+      [ -z "$bad" ] && msgs+=("[delegation-guard] No verifier run since the last code change. CLAUDE.md: before declaring done -> verifier (fresh context, can contradict you). Run it before you report this as done.")
     fi ;;
 esac
 
+[ -n "$bad" ] && exit 0           # no usable state: only the merge gate above applies
 [ -n "$in_subagent" ] && exit 0   # subagents do the reading/editing; that's the point
 
 if [ -n "$code_edit" ] && [ "$(get edits)" -ge "$EDIT_LIMIT" ]; then

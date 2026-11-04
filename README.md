@@ -2,7 +2,7 @@
 
 A small, copyable setup for running [Claude Code](https://code.claude.com) as **one boss and a team of cheaper specialists**, plus a script to measure what it saves you.
 
-From the talk *AI in the Wild: what it actually costs to build with it* (Digit, Tartu, 9 October 2026) by Iván Elorza Tahum.
+From the talk *AI in the Wild: what it actually costs to build with it* (Digit, Tartu, 9 October 2026; DevCon Bucharest, 4 November 2026) by Iván Elorza Tahum.
 
 ## Meter (cost meter mod)
 
@@ -28,12 +28,14 @@ The agents work on their own. Two hooks make the rules harder to forget. They ne
 
 ```bash
 mkdir -p .claude/hooks && cp claude-code-agent-orchestration/.claude/hooks/*.sh .claude/hooks/ && chmod +x .claude/hooks/*.sh
-cp claude-code-agent-orchestration/.claude/settings.json .claude/settings.json   # or merge its "hooks" block into yours
+cp claude-code-agent-orchestration/.claude/settings.json .claude/settings.json   # or merge its `hooks` and `permissions` blocks into yours
 ```
 
-- [`delegation-guard.sh`](.claude/hooks/delegation-guard.sh) reminds the boss to delegate (after 6 code-reading calls with no scout/log-digger, after 4 code edits with no implementer, and on `gh pr create`/`merge` with no verifier run). It **blocks** `gh pr merge` unless `pr-reviewer` was started on that PR after the last code change. It only knows the reviewer was started, not its verdict: read it before you merge. If the review happened elsewhere, add `# reviewed-by: <reason>` to the merge command. Thresholds and the folders it treats as "not code" are environment variables, documented at the top of the script.
+- [`delegation-guard.sh`](.claude/hooks/delegation-guard.sh) reminds the boss to delegate (after 6 code-reading calls with no scout/log-digger, after 4 code edits with no implementer, and on `gh pr create`/`merge` with no verifier run). It **blocks** a PR merge unless `pr-reviewer` was started on that PR after the last code change. It catches an unquoted `gh pr merge` (any flags, so `--auto` too) or `…/pulls/N/merge` API call; quoted or wrapped forms (`sh -c '…'`, a quoted API path, `"gh"`) are not seen, and neither are the desktop app's own auto-merge tool (`mcp__ccd_pr__set_auto_merge`), a GraphQL `enablePullRequestAutoMerge` call or the GitHub web UI. It is a guardrail, not a security boundary. It only knows the reviewer was started, not its verdict: read it before you merge. If the review happened elsewhere, add `# reviewed-by: <reason>` to the merge command. Thresholds and the folders it treats as "not code" are environment variables, documented at the top of the script.
 - [`worktree-guard.sh`](.claude/hooks/worktree-guard.sh) never blocks. Before a state-changing `git`/`gh` command it prints which repo and branch it will hit.
 - [`context-size-guard.sh`](.claude/hooks/context-size-guard.sh) never blocks. When the main session passes 350k tokens of context it mentions it once; at 500k it recommends `/compact` or a fresh session, because every step re-reads the whole context. Thresholds: `CONTEXT_WARN_1`, `CONTEXT_WARN_2`.
+
+`.claude/settings.json` also carries a `permissions.deny` block for `mcp__ccd_session__start_session` and `mcp__ccd_session__hand_off_to_session`, the Claude desktop app's session tools. It is what enforces the "one session, sub-agents only" rule in [`CLAUDE.md.example`](CLAUDE.md.example): Claude can't start or hand off to another session, only you can. Merge it into your own settings if you use the desktop app.
 
 To disable one, delete its entry from `.claude/settings.json`; to disable all, delete the file or the `hooks` block. Without `jq` the delegation checks switch themselves off, except that merges are refused rather than waved through.
 

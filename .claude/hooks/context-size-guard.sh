@@ -9,7 +9,8 @@
 #   CONTEXT_WARN_1 (default 350000): mention it in one line.
 #   CONTEXT_WARN_2 (default 500000): recommend /compact or a fresh session now.
 # Dropping back under the first level (after a compaction) re-arms both.
-# Warn-only: never blocks. Always exits 0. Needs jq; without it, does nothing.
+# State lives in a per-user folder; a symlinked or foreign-owned folder is refused (the
+# hook then does nothing). Warn-only: never blocks. Always exits 0. Needs jq; without it, does nothing.
 
 command -v jq >/dev/null 2>&1 || exit 0
 
@@ -40,14 +41,17 @@ tokens=$(tail -c 2000000 "$tp" | jq -Rr '
 umask 077
 base="${TMPDIR:-/tmp}/claude-context-size-$(id -u)"
 mkdir -p -m 700 "$base" 2>/dev/null || exit 0
-[ -O "$base" ] || exit 0
+# Refuse a symlinked, missing or foreign-owned folder (mkdir -p and -O both follow symlinks).
+{ [ -L "$base" ] || [ ! -d "$base" ] || [ ! -O "$base" ]; } && exit 0
 dir="$base/$sid"
 if [ "$tokens" -lt "$W1" ]; then
-  rm -rf "$dir"
+  [ -L "$dir" ] || rm -rf "$dir"
   exit 0
 fi
-mkdir -p "$dir"
-done_level=$(cat "$dir/level" 2>/dev/null || echo 0)
+mkdir -p "$dir" 2>/dev/null || exit 0
+{ [ -L "$dir" ] || [ ! -d "$dir" ] || [ ! -O "$dir" ]; } && exit 0
+done_level=$(cat "$dir/level" 2>/dev/null)
+case "$done_level" in ""|*[!0-9]*) done_level=0 ;; esac   # digits only; never trust file contents
 k=$((tokens / 1000))
 
 if [ "$tokens" -ge "$W2" ] && [ "$done_level" -lt 2 ]; then
