@@ -33,8 +33,9 @@ cp claude-code-agent-orchestration/.claude/settings.json .claude/settings.json  
 
 - [`delegation-guard.sh`](.claude/hooks/delegation-guard.sh) reminds the boss to delegate (after 6 code-reading calls with no scout/log-digger, after 4 code edits with no implementer, and on `gh pr create`/`merge` with no verifier run). It **blocks** `gh pr merge` unless `pr-reviewer` was started on that PR after the last code change. It only knows the reviewer was started, not its verdict: read it before you merge. If the review happened elsewhere, add `# reviewed-by: <reason>` to the merge command. Thresholds and the folders it treats as "not code" are environment variables, documented at the top of the script.
 - [`worktree-guard.sh`](.claude/hooks/worktree-guard.sh) never blocks. Before a state-changing `git`/`gh` command it prints which repo and branch it will hit.
+- [`context-size-guard.sh`](.claude/hooks/context-size-guard.sh) never blocks. When the main session passes 350k tokens of context it mentions it once; at 500k it recommends `/compact` or a fresh session, because every step re-reads the whole context. Thresholds: `CONTEXT_WARN_1`, `CONTEXT_WARN_2`.
 
-To disable one, delete its entry from `.claude/settings.json`; to disable both, delete the file or the `hooks` block. Without `jq` the delegation checks switch themselves off, except that merges are refused rather than waved through.
+To disable one, delete its entry from `.claude/settings.json`; to disable all, delete the file or the `hooks` block. Without `jq` the delegation checks switch themselves off, except that merges are refused rather than waved through.
 
 Then let Claude fit them to your project. Paste this into Claude Code:
 
