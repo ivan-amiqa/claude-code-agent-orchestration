@@ -5,7 +5,7 @@ import type { On } from 'claude-code'
 
 import type { MeterData, MeterGroup, MeterPr } from '../types'
 
-import { addToGroups, agentRowText, barSvg, beforeLoaded, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, niceTicks, niceTop, PALETTES, paletteFor, PRICE_RATIO, prUrlsIn, ringSvg, rollup, sane, sanePrs, shares, splitCost, splitParts, stackCells, tokens, truncate } from './register'
+import { addToGroups, agentRow, barSvg, beforeLoaded, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, niceTicks, niceTop, PALETTES, paletteFor, PRICE_RATIO, prUrlsIn, ringSvg, rollup, sane, sanePrs, shares, splitCost, splitParts, stackCells, tokens, truncate } from './register'
 
 const PANE = {
   plugin: 'meter',
@@ -105,6 +105,40 @@ const stored = (fixture: Fixture, e: { key: string }) => {
   return e.key === 'ci' ? { value: { version: 1, value: { shape: 'ci-1', value: ci } } } : { value: { version: 1, value: { shape: 'meter-6', value } } }
 }
 
+// -- the pane's tables, read back from the tree ------------------------------
+type Node = { type: string; props: Record<string, unknown>; children: (Node | string)[] }
+const textOf = (n: Node | string): string => (typeof n === 'string' ? n : (n.children ?? []).map(textOf).join(''))
+type Boxed = { findAll: (query: { type?: string; text?: string | RegExp }) => Promise<{ props: Record<string, unknown>; children: unknown[]; text: string }[]> }
+const boxes = async (ui: Boxed): Promise<Node[]> => (await ui.findAll({ type: 'Box' })).map(b => ({ type: 'Box', props: b.props, children: b.children as (Node | string)[] }))
+
+/** The shared legend: one entry per bucket row, with each cell's text and the box that lays it out. */
+type LegendCell = { text: string; width: unknown; align: unknown }
+const legendRows = async (ui: Boxed) => {
+  const out: { color: unknown; name: string; cost: string; costPct: string; tokens: string; tokensPct: string; cells: LegendCell[] }[] = []
+  for (const b of await boxes(ui)) {
+    const kids = b.children as Node[]
+    const first = kids[0]
+    if (kids.length !== 5 || first?.props.gap !== 1 || (first.children[0] as Node | undefined)?.children[0] !== '■') continue
+    const cells = kids.slice(1).map(c => ({ text: textOf(c), width: c.props.width, align: c.props.justifyContent }))
+    out.push({ color: (first.children[0] as Node).props.color, name: textOf(first.children[1] as Node), cost: cells[0]!.text, costPct: cells[1]!.text, tokens: cells[2]!.text, tokensPct: cells[3]!.text, cells })
+  }
+
+  return out
+}
+
+/** The agent rows: `name · Model` on the left; `read / written` and the dollars on the right. */
+const agentRows = async (ui: Boxed) => {
+  const out: { left: string; io: string; cost: string; width: unknown }[] = []
+  for (const b of await boxes(ui)) {
+    const kids = b.children as Node[]
+    if (b.props.justifyContent !== 'space-between' || kids.length !== 2 || textOf(kids[0] as Node).startsWith('●') === false) continue
+    const right = (kids[1] as Node).children as Node[]
+    out.push({ left: textOf((kids[0] as Node).children[1] as Node), io: textOf(right[0] as Node), cost: textOf(right[1] as Node), width: right[1]?.props.width })
+  }
+
+  return out
+}
+
 test('the pane draws live-shaped data on terminal and desktop', async ($, on) => {
   on('state.get', (_, e) => stored(live(), e))
 
@@ -113,8 +147,9 @@ test('the pane draws live-shaped data on terminal and desktop', async ($, on) =>
 
     expect((await ui.find({ type: 'Text', text: /\$3\.40/ }))?.text).toBe('$3.40')
     expect((await ui.find({ type: 'Text', text: /142k/ }))?.text).toBe('142k')
-    expect(await ui.find({ type: 'Text', text: /warm · 41 min left/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /implementer · Sonnet · 1\.1M read · 48k written · ≈\$0\.92/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'warm' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '41 min left' })).toBeDefined()
+    expect((await agentRows(ui)).find(r => r.left === 'implementer · Sonnet')).toMatchObject({ io: '1.1M / 48k', cost: '≈$0.92' })
     if (surface === 'terminal') {
       expect(await ui.find({ type: 'Text', text: /350k/ })).toBeDefined()
       expect(await ui.find({ type: 'Text', text: /\/compact/ })).toBeDefined()
@@ -469,8 +504,8 @@ test('a subagent request is told apart by agentId: its tokens and ledger growth 
   }
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /Explore · Haiku · 5k read · 20 written · ≈\$0\.25/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /Opus \(main\) ≈\$0\.50/ })).toBeDefined()
+  expect((await agentRows(ui)).find(r => r.left.startsWith('Explore · Haiku'))).toMatchObject({ io: '5k / 20', cost: '≈$0.25' })
+  expect((await legendRows(ui)).find(r => r.name === 'Opus (main)')?.cost).toBe('≈$0.50')
   expect(await ui.find({ type: 'Text', text: /\$1\.75/ })).toBeDefined()
   await ui.unmount()
 })
@@ -538,7 +573,7 @@ test('the very first step is counted: its cost is the growth from before it ran'
   for await (const _ of $.turn.step(stepInput())) void _
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /Opus \(main\) ≈\$0\.40/ })).toBeDefined()
+  expect((await legendRows(ui)).find(r => r.name === 'Opus (main)')?.cost).toBe('≈$0.40')
   expect(await ui.find({ type: 'Text', text: /\$5\.40/ })).toBeDefined()
   await ui.unmount()
 })
@@ -572,8 +607,10 @@ test('two interleaved agents book each step to its own agentId', async ($, on) =
   await Promise.all([pa, pb])
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /scout · Haiku · 5k read · 20 written · ≈\$0\.30/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /log-digger · Haiku · 5k read · 20 written · ≈\$0\.50/ })).toBeDefined()
+  const rows = await agentRows(ui)
+  // both still run; with the words 'log-digger' would be cut at 42 cells, so every row says it with the glyph
+  expect(rows.map(r => [r.io, r.cost])).toEqual([['5k / 20', '≈$0.50'], ['5k / 20', '≈$0.30']])
+  expect(rows.map(r => r.left)).toEqual(['log-digger · Haiku ▶', 'scout · Haiku ▶'])
   await ui.unmount()
 })
 
@@ -639,7 +676,7 @@ test('a resumed spawn keeps its row (tokens and dollars), is not rewritten and r
   expect(seen).toEqual(['haiku', undefined])
   expect(toasts).toHaveLength(toastsBefore)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /Explore · Haiku · 5k read · 20 written · ≈\$0\.25 · running/ })).toBeDefined()
+  expect((await agentRows(ui)).find(r => r.left === 'Explore · Haiku · running')).toMatchObject({ io: '5k / 20', cost: '≈$0.25' })
   await ui.unmount()
 })
 
@@ -1076,20 +1113,21 @@ test('token formatting: under 1k as is, k with no decimals, 1.1M at a million', 
   expect([0, 999, 1_000, 48_400, 310_000, 999_400, 1_100_000, 2_460_000].map(tokens)).toEqual(['0', '999', '1k', '48k', '310k', '999k', '1.1M', '2.5M'])
 })
 
-test('two bars (Cost, Tokens written) share colours; each bar has its own legend (money under Cost, written tokens under Tokens written)', async ($, on) => {
+test('two bars (Cost, Tokens written) share colours; ONE legend table under both has the money and the tokens of every bucket', async ($, on) => {
   on('state.get', (_, e) => stored(live(), e))
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ type: 'Text', text: 'Cost' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'Tokens written' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'Sonnet ≈$0.92' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'Opus (main) ≈$1.32' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'Opus (agents) ≈$1.04' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'Sonnet 48k' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'Opus (main) 21k' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'Opus (agents) 9k' })).toBeDefined()
-    // the old combined legend is gone
-    expect(await ui.find({ type: 'Text', text: /≈\$.* · .*written/ })).toBeUndefined()
+    const rows = await legendRows(ui)
+    const pick = (name: string) => rows.find(r => r.name === name)
+    expect(pick('Sonnet')).toMatchObject({ cost: '≈$0.92', tokens: '48k' })
+    expect(pick('Opus (main)')).toMatchObject({ cost: '≈$1.32', tokens: '21k' })
+    expect(pick('Opus (agents)')).toMatchObject({ cost: '≈$1.04', tokens: '9k' })
+    // one table, one row per bucket: no second legend with the tokens on their own
+    expect(rows.map(r => r.name)).toEqual(['Opus (main)', 'Haiku', 'Sonnet', 'Opus (agents)'])
+    expect(await ui.find({ type: 'Text', text: 'Sonnet 48k' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'Sonnet ≈$0.92' })).toBeUndefined()
     await ui.unmount()
   }
 
@@ -1133,11 +1171,7 @@ test('a bucket with no cost and nothing written is not drawn', async ($, on) => 
       ),
   )
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /Haiku ≈/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /Sonnet ≈/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /Opus \(agents\) ≈/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: 'Opus (main) ≈$3.40' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'Opus (main) 30k' })).toBeDefined()
+  expect((await legendRows(ui)).map(r => [r.name, r.cost, r.tokens])).toEqual([['Opus (main)', '≈$3.40', '30k']])
   expect(await ui.find({ type: 'Text', text: /^Haiku/ })).toBeUndefined()
   await ui.unmount()
 })
@@ -1146,12 +1180,10 @@ test('"Before Meter loaded" is the grey first part of the cost bar and makes the
   on('state.get', (_, e) => stored(live({ costUsd: 5.4 }), e)) // 3.40 booked, 2.00 from before
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    const entries = (await ui.findAll({ type: 'Text' })).filter(t => /^(Before Meter loaded|Opus|Haiku|Sonnet)/.test(t.text) && /≈\$/.test(t.text) && !/·.*read/.test(t.text))
-    const sum = entries.reduce((n, t) => n + Number(/≈\$([0-9.]+)/.exec(t.text)?.[1]), 0)
-    expect(entries[0]?.text).toBe('Before Meter loaded ≈$2.00')
+    const rows = await legendRows(ui)
+    const sum = rows.reduce((n, r) => n + Number(/≈\$([0-9.]+)/.exec(r.cost)?.[1]), 0)
+    expect(rows[0]).toMatchObject({ name: 'Before Meter loaded', cost: '≈$2.00', tokens: '—', tokensPct: '—' })
     expect(Math.abs(sum - 5.4) < 0.005).toBe(true)
-    // no tokens for it, and no grey legend value for tokens
-    expect(entries[0]?.text).not.toContain('written')
     const swatch = (await ui.findAll({ type: 'Text', text: '■' }))[0]
     expect(swatch?.props.color).toBe(surface === 'terminal' ? 'inactive' : '#9CA3AF')
     if (surface === 'desktop') {
@@ -1163,26 +1195,21 @@ test('"Before Meter loaded" is the grey first part of the cost bar and makes the
   }
 })
 
-test('the cost legend carries money only, the tokens legend carries token counts only and no Before Meter loaded', async ($, on) => {
+test('the shared legend has the cost columns first, then the tokens, and no tokens for Before Meter loaded', async ($, on) => {
   on('state.get', (_, e) => stored(live({ costUsd: 5.4 }), e)) // 2.00 from before
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
-    const buckets = /^(Before Meter loaded|Opus \((main|agents)\)|Haiku|Sonnet)/
-    const costLegend = texts.filter(t => buckets.test(t) && /≈\$/.test(t) && !/ read /.test(t))
-    const tokenLegend = texts.filter(t => /^(Opus \((main|agents)\)|Haiku|Sonnet) [0-9.]+[kM]?$/.test(t))
-    expect(costLegend.length).toBe(5)
-    for (const t of costLegend) {
-      expect(t).toMatch(/≈\$[0-9.]+$/)
-      expect(t).not.toContain('written')
-    }
-    expect(tokenLegend).toEqual(['Opus (main) 21k', 'Haiku 2k', 'Sonnet 48k', 'Opus (agents) 9k'])
-    for (const t of tokenLegend) {
-      expect(t).not.toContain('$')
-      expect(t).not.toContain('Before Meter loaded')
-    }
-    expect(texts.some(t => /^Before Meter loaded ≈\$/.test(t))).toBe(true)
-    expect(texts.filter(t => t.includes('Before Meter loaded')).length).toBe(1) // only under Cost
+    const rows = await legendRows(ui)
+    expect(rows.map(r => r.name)).toEqual(['Before Meter loaded', 'Opus (main)', 'Haiku', 'Sonnet', 'Opus (agents)'])
+    expect(rows.map(r => r.cost)).toEqual(['≈$2.00', '≈$1.32', '≈$0.12', '≈$0.92', '≈$1.04'])
+    expect(rows.map(r => r.tokens)).toEqual(['—', '21k', '2k', '48k', '9k'])
+    expect(rows.every(r => !r.cost.includes('k') && !r.tokens.includes('$'))).toBe(true)
+    // the header names the two column pairs, small and muted
+    const head = (await ui.findAll({ type: 'Text', text: /^(Cost|Written)$/ })).filter(t => t.props.dimColor === true)
+    expect(head.map(t => t.text).slice(-2)).toEqual(['Cost', 'Written'])
+    expect(head.every(t => t.props.size === 'caption')).toBe(true)
+    // the old per-bar legends are gone
+    expect(await ui.find({ type: 'Text', text: /^Opus \(main\) / })).toBeUndefined()
     await ui.unmount()
   }
 })
@@ -1204,27 +1231,60 @@ test('legend shares: whole percents by largest remainder, <1% under half a perce
   expect(shares([Number.NaN, 4])).toEqual(['0%', '100%'])
 })
 
-test('both legends show each entry share of its own bar, dim, on terminal and desktop', async ($, on) => {
+test('the legend shows each bucket share of its own bar; both percent columns add up to 100, the no-token row is a dash', async ($, on) => {
   on('state.get', (_, e) => stored(live({ costUsd: 5.4 }), e)) // 2.00 before + 3.40 booked
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    const pcts = (await ui.findAll({ type: 'Text' })).filter(t => /^· (<1|\d+)%$/.test(t.text))
+    const rows = await legendRows(ui)
     // cost: before, Opus (main), Haiku, Sonnet, Opus (agents); tokens: Opus (main), Haiku, Sonnet, Opus (agents)
-    expect(pcts.map(t => t.text)).toEqual(['· 37%', '· 25%', '· 2%', '· 17%', '· 19%', '· 26%', '· 3%', '· 60%', '· 11%'])
-    expect(pcts.every(t => t.props.dimColor === true)).toBe(true)
-    // the money and token values stay their own entries
-    expect(await ui.find({ type: 'Text', text: 'Before Meter loaded ≈$2.00' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'Sonnet 48k' })).toBeDefined()
+    expect(rows.map(r => r.costPct)).toEqual(['37%', '25%', '2%', '17%', '19%'])
+    expect(rows.map(r => r.tokensPct)).toEqual(['—', '26%', '3%', '60%', '11%'])
+    const total = (xs: string[]) => xs.reduce((n, t) => n + (/^\d+%$/.test(t) ? parseInt(t, 10) : 0), 0)
+    expect(total(rows.map(r => r.costPct))).toBe(100)
+    expect(total(rows.map(r => r.tokensPct))).toBe(100)
+    // the percent cells are dim; the money and token cells are not
+    expect(rows.every(r => r.cells[1]?.text === r.costPct && r.cells[3]?.text === r.tokensPct)).toBe(true)
+    const dim = (await ui.findAll({ type: 'Text' })).filter(t => /^(<1|\d+)%$/.test(t.text))
+    expect(dim.length).toBe(9)
+    expect(dim.every(t => t.props.dimColor === true)).toBe(true)
     await ui.unmount()
   }
 })
 
-test('a zero total draws no percent in the legends', async ($, on) => {
+test('a bucket under half a percent shows <1% and the rest still add up to 100', async ($, on) => {
+  on('state.get', (_, e) => stored(live({ costUsd: 3.4, spend: { 'opus-main': 3.39, haiku: 0.01, sonnet: 0, 'opus-checks': 0 }, written: { 'opus-main': 30_000, haiku: 100, sonnet: 0, 'opus-checks': 0 } }), e))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const rows = await legendRows(ui)
+  expect(rows.map(r => [r.name, r.costPct, r.tokensPct])).toEqual([['Opus (main)', '100%', '100%'], ['Haiku', '<1%', '<1%']])
+  await ui.unmount()
+})
+
+test('the legend columns line up: every row uses the same widths, numbers right-aligned', async ($, on) => {
+  on('state.get', (_, e) => stored(live({ costUsd: 25.4, spend: { 'opus-main': 17.95, haiku: 0.12, sonnet: 2.4, 'opus-checks': 2.93 }, written: { 'opus-main': 1_210_000, haiku: 2_000, sonnet: 48_000, 'opus-checks': 9_000 } }), e))
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const rows = await legendRows(ui)
+    expect(rows.length).toBe(5)
+    const shape = (r: (typeof rows)[number]) => r.cells.map(c => `${String(c.width)}/${String(c.align)}`)
+    for (const r of rows) expect(shape(r)).toEqual(shape(rows[0]!))
+    for (const c of rows[0]!.cells) expect(c.align).toBe('flex-end')
+    // the widest entry (≈$17.95, 7) fits its column; the name column takes the rest of the 42 cells
+    const widths = rows[0]!.cells.map(c => Number(c.width))
+    expect(widths[0]).toBeGreaterThanOrEqual('≈$17.95'.length)
+    expect(widths[2]).toBeGreaterThanOrEqual('1.2M'.length)
+    // header: Cost spans the cost + % columns, Written the tokens + % columns
+    const head = (await boxes(ui)).find(b => b.props.width === 42 && b.children.length === 3 && textOf(b) === 'CostWritten')
+    expect((head?.children as Node[]).slice(1).map(c => c.props.width)).toEqual([Number(widths[0]) + Number(widths[1]), Number(widths[2]) + Number(widths[3])])
+    await ui.unmount()
+  }
+})
+
+test('a zero total draws no percent in the legend', async ($, on) => {
   on('state.get', (_, e) => stored(live({ costUsd: 0, spend: { 'opus-main': 0, haiku: 0, sonnet: 0, 'opus-checks': 0 }, written: { 'opus-main': 0, haiku: 0, sonnet: 5, 'opus-checks': 0 } }), e))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const pcts = (await ui.findAll({ type: 'Text' })).filter(t => /^· (<1|\d+)%$/.test(t.text))
+  const rows = await legendRows(ui)
   // cost total is zero: no cost percent; the one token entry is 100%
-  expect(pcts.map(t => t.text)).toEqual(['· 100%'])
+  expect(rows.map(r => [r.name, r.costPct, r.tokensPct])).toEqual([['Sonnet', '', '100%']])
   await ui.unmount()
 })
 
@@ -1250,8 +1310,7 @@ test('a main-thread step books its output tokens and cost to the bucket, and add
   for await (const _ of $.turn.step(stepInput())) void _
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: 'Opus (main) ≈$0.40' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'Opus (main) 20' })).toBeDefined()
+  expect((await legendRows(ui)).find(r => r.name === 'Opus (main)')).toMatchObject({ cost: '≈$0.40', tokens: '20' })
   expect(await ui.find({ type: 'Text', text: 'Dollars per step' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'no steps yet' })).toBeUndefined()
   await ui.unmount()
@@ -1269,7 +1328,7 @@ test('an agent with no spawn record is named from the engine list, not "agent"',
   for await (const _ of $.turn.step(stepInput('w9'))) void _
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /implementer · Sonnet · 5k read · 20 written/ })).toBeDefined()
+  expect((await agentRows(ui)).find(r => r.left.startsWith('implementer · Sonnet'))).toMatchObject({ io: '5k / 20' })
   await ui.unmount()
 })
 
@@ -1795,8 +1854,8 @@ test('agent runs fold into one row per type and model, with summed tokens and do
     agentRun('i3', 'implementer', 'Sonnet', 'sonnet', 3_000_000, 40_000, 0.52),
   ])
   expect(rows.map(r => `${r.name}/${r.model}/${r.runs}`)).toEqual(['implementer/Sonnet/3', 'scout/Haiku/1'])
-  expect(agentRowText(rows[0] as never)).toBe('implementer · Sonnet · 3 runs · 12.5M read · 135k written · ≈$2.72')
-  expect(agentRowText(rows[1] as never)).toBe('scout · Haiku · 40k read · 900 written · ≈$0.06') // one run: no runs part
+  expect(agentRow(rows[0] as never, 80)).toMatchObject({ left: 'implementer ×3 · Sonnet', io: '12.5M / 135k', cost: '≈$2.72', cut: false })
+  expect(agentRow(rows[1] as never, 80)).toMatchObject({ left: 'scout · Haiku', io: '40k / 900', cost: '≈$0.06', cut: false }) // one run: no ×
 })
 
 test('the same agent type on two models stays two rows; a running run marks its row; rows sort by dollars', () => {
@@ -1808,12 +1867,12 @@ test('the same agent type on two models stays two rows; a running run marks its 
   ])
   expect(rows.map(r => `${r.name}/${r.model}`)).toEqual(['verifier/Opus', 'scout/Haiku', 'verifier/Sonnet'])
   expect(rows.map(r => r.usd)).toEqual([2, 0.9, 0.3])
-  expect(agentRowText(rows[0] as never)).toMatch(/verifier · Opus · 2 runs · .* · ≈\$2\.00 · running$/)
-  expect(agentRowText(rows[1] as never)).toMatch(/ · stopped$/)
-  expect(agentRowText(rows[2] as never)).not.toMatch(/running|stopped/)
+  expect(agentRow(rows[0] as never, 80)).toMatchObject({ left: 'verifier ×2 · Opus · running', cost: '≈$2.00' })
+  expect(agentRow(rows[1] as never, 80).left).toMatch(/ · stopped$/)
+  expect(agentRow(rows[2] as never, 80).left).not.toMatch(/running|stopped/)
   // A partly failed group says how many stopped, and a control character in a name never reaches the row.
   const mixed = groupAgents([agentRun('m1', 'a\u001bb', 'Opus', 'opus-checks', 1, 1, 1, 'failed'), agentRun('m2', 'a\u001bb', 'Opus', 'opus-checks', 1, 1, 1)])
-  expect(agentRowText(mixed[0] as never)).toBe('a b · Opus · 2 runs · 2 read · 2 written · ≈$2.00 · 1 stopped')
+  expect(agentRow(mixed[0] as never, 80)).toMatchObject({ left: 'a b ×2 · Opus · 1 stopped', io: '2 / 2', cost: '≈$2.00', cut: false })
 })
 
 test('the pane draws one row per agent type and model, on terminal and desktop', async ($, on) => {
@@ -1834,9 +1893,13 @@ test('the pane draws one row per agent type and model, on terminal and desktop',
   )
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ type: 'Text', text: /implementer · Sonnet · 3 runs · 12\.5M read · 135k written · ≈\$2\.72 · running/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /scout · Haiku · 40k read · 900 written · ≈\$0\.06/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /implementer · Sonnet · 5\.0M read/ })).toBeUndefined() // no per-run row
+    const rows = await agentRows(ui)
+    // one row per type and model; the implementer's three runs are one row, running (▶ when the words would not leave its name room)
+    expect(rows.map(r => [r.left, r.io, r.cost])).toEqual([
+      ['imple… ×3 · Sonnet ▶', '12.5M / 135k', '≈$2.72'],
+      ['scout · Haiku', '40k / 900', '≈$0.06'],
+    ])
+    expect(rows.every(r => r.width === rows[0]?.width)).toBe(true) // the dollars share one right-aligned column
     await ui.unmount()
   }
 })
@@ -1966,14 +2029,14 @@ test('every drawn Svg carries alt text and its size in pixels', async ($, on) =>
   on('state.get', (_, e) => stored(live(), e))
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const all = await ui.findAll({ type: 'Svg' })
-  expect(all).toHaveLength(5) // gauge, cache ring, cost bar, tokens bar, dollars
+  expect(all).toHaveLength(5) // cache ring, gauge, cost bar, tokens bar, dollars
   for (const s of all) {
     expect(String(s.props.alt).length).toBeGreaterThan(5)
     expect(typeof s.props.width).toBe('number')
     expect(typeof s.props.height).toBe('number')
     wellFormed(String(s.props.source))
   }
-  expect(all.map(s => s.props.height)).toEqual([32, 28, 6, 6, 180])
+  expect(all.map(s => s.props.height)).toEqual([28, 32, 6, 6, 135]) // the docked pane's chart is a quarter shorter
   await ui.unmount()
 })
 
@@ -2371,10 +2434,10 @@ test('an agent name with ESC and 5000 characters draws at 40 characters or fewer
   const long = (id: string, name: string) => ({ ...live().agents[0]!, id, name })
   on('state.get', (_, e) => stored(live({ agents: [long('x1', 'sc\u001bout'), long('x2', `n${'y'.repeat(5000)}`)] }), e))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const rows = (await ui.findAll({ type: 'Text' })).filter(t => / · Haiku · /.test(t.text))
+  const rows = (await agentRows(ui)).map(r => r.left)
   expect(rows).toHaveLength(2)
-  expect(rows[0]?.text.startsWith('sc out · Haiku')).toBe(true)
-  const name = rows[1]?.text.split(' · ')[0] ?? ''
+  expect(rows[0]?.startsWith('sc out · Haiku')).toBe(true)
+  const name = rows[1]?.split(' · ')[0] ?? ''
   expect(name.length).toBeLessThanOrEqual(40)
   expect(name.endsWith('…')).toBe(true)
   await noControlText(ui)
@@ -2431,4 +2494,129 @@ test('"gh pr view <url>" after && or ; feeds the pane; inside echo it does not',
   await $.tool.call({ tool: 'Bash', command: `cat f | gh pr merge ${url.replace('/1', '/4')}` })
   await clock.advance(5)
   expect(calls.map(c => c[3]).sort()).toEqual(['https://github.com/a/b/pull/2', 'https://github.com/a/b/pull/3', 'https://github.com/a/b/pull/4'])
+})
+
+// -- Compact layout: three tiles, one line per agent, a one-line Guard -------------
+const tilesOf = async (ui: Boxed) => (await boxes(ui)).find(b => b.children.length === 3 && (b.children as Node[]).every(c => c.type === 'Box' && c.props.flexDirection === 'column' && typeof c.props.width === 'number'))
+
+test('Session cost, Context and Cache are one row of three equal tiles, the gauge directly under it', async ($, on) => {
+  on('state.get', (_, e) => stored(live(), e))
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const row = await tilesOf(ui)
+    expect(row?.props.width).toBe(42)
+    const tiles = row?.children as Node[]
+    expect(tiles.map(t => t.props.width)).toEqual([14, 14, 14]) // equal thirds of the pane
+    expect(tiles.map(t => ((t.children[0] as Node).children[0] as string))).toEqual(['Session cost', 'Context', 'Cache'])
+    const text = tiles.map(textOf)
+    expect(text[0]).toBe('Session cost$3.40list price')
+    expect(text[1]).toBe('Context142kread each call')
+    expect(text[2]).toContain('warm')
+    expect(text[2]).toContain('41 min left') // the minutes stay visible
+    expect(text[2]).toContain('1h cache')
+    // big numbers, the context one in its zone colour
+    const big = (await ui.findAll({ type: 'Text' })).filter(t => t.props.size === 'title' && /^(\$3\.40|142k)$/.test(t.text))
+    expect(big.map(t => [t.text, t.props.color])).toEqual([['$3.40', undefined], ['142k', 'success']])
+    // the gauge follows the row at full width, before "Who did the work"
+    const gauge = surface === 'terminal' ? await ui.find({ type: 'Text', text: /350k/ }) : (await ui.findAll({ type: 'Svg' })).find(x => /^Context/.test(String(x.props.alt)))
+    expect(gauge).toBeDefined()
+    if (surface === 'desktop') expect((await ui.findAll({ type: 'Svg' })).map(x => String(x.props.alt).split(' ')[0])).toEqual(['Cache', 'Context', 'Cost', 'Tokens', 'Dollars'])
+    const order = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    expect(order.indexOf('Cache')).toBeGreaterThan(order.indexOf('Session cost'))
+    expect(order.indexOf('Who did the work')).toBeGreaterThan(order.indexOf('Cache'))
+    if (surface === 'terminal') expect(order.findIndex(t => /350k/.test(t))).toBeGreaterThan(order.indexOf('Cache')) // the gauge ticks follow the tiles
+    await ui.unmount()
+  }
+})
+
+test('a context over 500k keeps its red number in the tile; a cold cache says what the next call re-writes under the gauge', async ($, on) => {
+  on('state.get', (_, e) => stored(live({ contextTokens: 520_000, lastResponseAt: NOW - 90 * MIN }), e))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: '520k' }))?.props.color).toBe('error')
+  expect(textOf((await tilesOf(ui)) as Node)).toContain('cold')
+  const cold = await ui.find({ type: 'Text', text: /^cold — next call re-writes 520k\. A fresh session is cheaper\.$/ })
+  expect(cold?.props.color).toBe('error')
+  await ui.unmount()
+})
+
+test('on a pane too narrow for three tiles they stack, with the same information', async ($, on) => {
+  on('state.get', (_, e) => stored(live(), e))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 30 } })
+  expect(await tilesOf(ui)).toBeUndefined()
+  for (const t of ['Session cost', 'Context', 'Cache', '$3.40', '142k', 'list price', '41 min left']) expect(await ui.find({ type: 'Text', text: t })).toBeDefined()
+  await ui.unmount()
+})
+
+test('an agent row is one line: the name gives way to a long model or state, never the tokens or the dollars', async ($, on) => {
+  const long = (id: string, name: string, usd: number) => ({ ...live().agents[0]!, id, name, usd })
+  on('state.get', (_, e) => stored(live({ agents: [long('a', 'a-very-long-agent-type-name-for-a-narrow-pane', 12.34), long('b', 'scout', 0.06)] }), e))
+  const lengths: number[] = []
+  for (const bodyColumns of [44, 60, 100]) {
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns } })
+    const rows = await agentRows(ui)
+    expect(rows).toHaveLength(2)
+    const room = bodyColumns - 2
+    for (const r of rows) {
+      // dot + name · Model, read / written, ≈$ -- all of it fits one row of `room` characters
+      expect(2 + r.left.length + 1 + r.io.length + 1 + r.cost.length).toBeLessThanOrEqual(room)
+      expect(r.io).toBe('38k / 900')
+      expect(r.left.endsWith(' · Haiku')).toBe(true)
+    }
+    expect(rows.map(r => r.cost)).toEqual(['≈$12.34', '≈$0.06'])
+    lengths.push(rows[0]?.left.length ?? 0)
+    expect(rows[1]?.left).toBe('scout · Haiku')
+    // the dollars column is one width, right-aligned
+    expect(new Set(rows.map(r => r.width)).size).toBe(1)
+    await ui.unmount()
+  }
+  expect(lengths[0]).toBeLessThan(lengths[1]!) // the wider the pane, the more of the name
+  expect(lengths[1]).toBeLessThan(lengths[2]!)
+})
+
+test('agentRow cuts only the name, with a …, and falls back to glyphs when the words would cut it', () => {
+  const g = { name: 'implementer', model: 'Sonnet', bucket: 'sonnet' as const, runs: 2, read: 12_500_000, written: 135_000, usd: 2.72, running: true, failed: 0 }
+  expect(agentRow(g, 120)).toEqual({ left: 'implementer ×2 · Sonnet · running', io: '12.5M / 135k', cost: '≈$2.72', cut: false })
+  expect(agentRow(g, 44).cut).toBe(true)
+  expect(agentRow(g, 44, false)).toEqual({ left: 'impleme… ×2 · Sonnet ▶', io: '12.5M / 135k', cost: '≈$2.72', cut: true })
+  // never below four characters of the name, and the rest is never touched
+  expect(agentRow(g, 10, false).left).toBe('imp… ×2 · Sonnet ▶')
+  expect(agentRow({ ...g, running: false, failed: 2 }, 40, false).left.endsWith(' · Sonnet ✕')).toBe(true)
+  expect(agentRow({ ...g, running: false, failed: 1 }, 40, false).left.endsWith(' · Sonnet ✕1')).toBe(true)
+})
+
+test('the pane has no title and body for Guard when nothing was blocked: one muted line', async ($, on) => {
+  on('state.get', (_, e) => stored(live({ guardLines: [] }), e))
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const line = await ui.find({ type: 'Text', text: 'Guard · nothing blocked yet' })
+    expect(line?.props.dimColor).toBe(true)
+    expect(line?.props.size).toBe('caption')
+    expect(await ui.find({ type: 'Text', text: /^Guard$/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /nothing blocked or switched/ })).toBeUndefined()
+    await ui.unmount()
+  }
+})
+
+test('with something blocked or switched Guard keeps its title and a row for each', async ($, on) => {
+  on('state.get', (_, e) => stored(live(), e))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^Guard$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Blocked: nested agent' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Explore → switched to Haiku' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Guard · nothing/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('Dollars per step is a quarter shorter in the docked pane and keeps its full height expanded', async ($, on) => {
+  on('state.get', (_, e) => stored(live(), e))
+  const heightAt = async (bodyColumns: number) => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, bodyColumns } })
+    const svg = (await ui.findAll({ type: 'Svg' })).find(x => /^Dollars per step/.test(String(x.props.alt)))
+    await ui.unmount()
+
+    return svg?.props.height
+  }
+  expect(await heightAt(44)).toBe(135)
+  expect(await heightAt(62)).toBe(135)
+  expect(await heightAt(100)).toBe(180)
 })

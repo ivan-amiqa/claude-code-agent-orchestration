@@ -26,13 +26,11 @@ Then run `/meter` to open the pane.
 
 | Section | What it tells you |
 |---|---|
-| **Session cost** | Dollars so far, at list price |
-| **Context** | How many tokens every call re-reads, with the 350k and 500k marks |
-| **Cache** | A countdown to the prompt cache going cold (5 minute or 1 hour), reset on every call |
-| **Who did the work** | Cost and tokens written, split into Opus (main), Haiku, Sonnet and Opus (checks), plus one row per agent type and model (runs added up): runs, tokens read and written, cost, running or done, most expensive first |
+| **Session cost**, **Context**, **Cache** | Three tiles in one row. Cost: dollars so far, at list price. Context: how many tokens every call re-reads, with a full-width gauge under the row marking 350k and 500k. Cache: a countdown to the prompt cache going cold (5 minute or 1 hour), reset on every call, with the minutes left |
+| **Who did the work** | A Cost bar and a Tokens written bar, split into Opus (main), Haiku, Sonnet and Opus (agents), with one table under both: per bucket the cost and its share, the tokens written and their share. Below it one line per agent type and model (runs added up, `implementer ×2`): tokens read / written, cost, running or stopped, most expensive first |
 | **GitHub** | The PRs this session opened, viewed or merged, with their state and check results |
 | **Dollars per step** | A column chart of main-conversation steps, each split into what was re-read from cache, what was newly stored, and the model's answer, with a mark where you ran `/compact` |
-| **Guard** | A line for every agent the mod blocked or switched |
+| **Guard** | A line for every agent the mod blocked or switched; one muted line while there is nothing to report |
 
 The status line under the prompt stays empty and only appears with a warning: context past 350k or 500k, or a cold cache while the context is large.
 
