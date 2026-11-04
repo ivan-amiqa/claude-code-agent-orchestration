@@ -28,7 +28,7 @@ const NOW = 1_000_000_000_000
 const pr = (over: Partial<MeterPr> = {}): MeterPr => ({
   url: 'https://github.com/acme/web-api/pull/7',
   label: 'acme/web-api#7',
-  title: 'fix: the Blue onboarding fixes',
+  title: 'fix: onboarding fixes',
   kind: 'open',
   adds: 12,
   dels: 3,
@@ -272,7 +272,7 @@ const VIEW = (over: Record<string, unknown> = {}) =>
       run('e2e', '', 'IN_PROGRESS'),
       { __typename: 'StatusContext', context: 'Vercel', startedAt: '2026-11-01T20:57:16Z', state: 'PENDING', targetUrl: 'https://vercel.com/x' },
     ],
-    title: 'fix: the Blue onboarding fixes',
+    title: 'fix: onboarding fixes',
     url: 'https://github.com/a-b/c.d/pull/12',
     ...over,
   })
@@ -929,7 +929,7 @@ test('a PR row reads like the app: icon + title, repo #N +adds -dels, dot + pass
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ type: 'Text', text: 'fix: the Blue onboarding fixes' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'fix: onboarding fixes' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'web-api' })).toBeDefined()
     expect(await ui.find({ type: 'Link', text: '#7' })).toBeDefined()
     expect((await ui.find({ type: 'Text', text: '+12' }))?.props.color).toBe('success')
@@ -2085,7 +2085,7 @@ test('the tracked PRs survive a bump of the data tag: they are in their own atom
   )
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Link', text: /#7/ })).toBeDefined() // the PR is still there
-  expect(await ui.find({ type: 'Text', text: 'fix: the Blue onboarding fixes' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'fix: onboarding fixes' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /\$3\.40/ })).toBeUndefined() // while the old data reads as empty
   expect(await ui.find({ type: 'Text', text: 'no steps yet' })).toBeDefined()
   await ui.unmount()
