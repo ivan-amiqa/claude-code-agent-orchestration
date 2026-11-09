@@ -85,7 +85,8 @@ export type MeterPr = {
 // change to MeterData, and keep `sane()` in step with it: a stored value is
 // never trusted to be complete. The tracked PRs are NOT in here: they live in
 // their own atom (key `ci`, shape `ci-1`, a `MeterPr[]`) so that a bump of this
-// tag never wipes them.
+// tag never wipes them. The Codex runs are a third atom (key `codex`, shape
+// `codex-1`, a `MeterCodex`) for the same reason.
 export type MeterData = {
   /** Session cost at list price, dollars: the engine's own total. */
   costUsd: number
@@ -124,8 +125,72 @@ export type MeterData = {
   lastVerifierAt: number | null
 }
 
+/** How a Codex run was paid for: the ChatGPT plan, the API, or neither (skipped / failed before a model ran). */
+export type CodexAuth = 'plan' | 'api' | 'none'
+
+/**
+ * One row of `~/.amiqa/codex-review-runs.csv`, as the mod keeps it. Only these
+ * fields survive the parse: the log's `user` (an email), `repo` and `out_dir`
+ * (local paths), `head_sha` and `base_sha` are dropped before anything is stored.
+ */
+export type CodexRun = {
+  /** The PR label (`acme/web-api#12`): outside text, cleaned of control characters and cut to 40. */
+  label: string
+  /** The row's UTC timestamp, ms since epoch. */
+  at: number
+  durationS: number
+  input: number
+  cached: number
+  output: number
+  auth: CodexAuth
+  fellBack: boolean
+  /** null when the column is empty or not a number. */
+  exitCode: number | null
+  /** Why the run was skipped (`no_code`...); '' when it was not. */
+  skip: string
+}
+
+/**
+ * The Codex runs of THIS session (rows at or after the session's `startedAt`),
+ * its own atom (key `codex`, shape `codex-1`). Nothing here is read from
+ * `~/.codex`; the one source is the CSV, at a fixed path.
+ */
+export type MeterCodex = {
+  /** The latest rows, oldest first, at most 8. Skipped rows included. */
+  runs: CodexRun[]
+  /** Over EVERY session row read (at most the log's last 500 lines), skipped rows left out of `runs`. */
+  totals: {
+    /** Rows that were not skipped. */
+    runs: number
+    durationS: number
+    input: number
+    cached: number
+    output: number
+    /** API-equivalent dollars: per run ((input - cached) * 2 + cached * 0.10 + output * 10) / 1e6. */
+    usd: number
+  }
+  /** When each plan run that finished with exit 0 ended (ms), whatever the session; at most 500. For the limit estimate only. */
+  planDoneAt: number[]
+}
+
+/**
+ * The plan limit Ivan types in by hand (`/meter codex 97 6d2h`). Kept in
+ * `$.store` under the key `codex-limits-1`, so it outlives the session. The
+ * reset times are stored as absolute ms (entry time + the duration typed).
+ */
+export type CodexLimits = {
+  /** Percent of the weekly allowance left when it was entered, 0-100. */
+  weekPct: number
+  weekResetAt: number
+  /** The 5-hour window, when typed; both null or both set. */
+  fiveHPct: number | null
+  fiveHResetAt: number | null
+  /** When it was entered, ms since epoch. */
+  enteredAt: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    meter: { data: Shaped<MeterData>; ci: Shaped<MeterPr[]> }
+    meter: { data: Shaped<MeterData>; ci: Shaped<MeterPr[]>; codex: Shaped<MeterCodex> }
   }
 }
