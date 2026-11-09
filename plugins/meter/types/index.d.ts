@@ -86,7 +86,7 @@ export type MeterPr = {
 // never trusted to be complete. The tracked PRs are NOT in here: they live in
 // their own atom (key `ci`, shape `ci-1`, a `MeterPr[]`) so that a bump of this
 // tag never wipes them. The Codex runs are a third atom (key `codex`, shape
-// `codex-1`, a `MeterCodex`) for the same reason.
+// `codex-3`, a `MeterCodex`) for the same reason.
 export type MeterData = {
   /** Session cost at list price, dollars: the engine's own total. */
   costUsd: number
@@ -129,12 +129,13 @@ export type MeterData = {
 export type CodexAuth = 'plan' | 'api' | 'none'
 
 /**
- * One row of `~/.amiqa/codex-review-runs.csv`, as the mod keeps it. Only these
+ * One row of `~/.amiqa/codex-review-runs.csv`, as `parseCodex` reads it. Only these
  * fields survive the parse: the log's `user` (an email), `repo` and `out_dir`
- * (local paths), `head_sha` and `base_sha` are dropped before anything is stored.
+ * (local paths), `head_sha` and `base_sha` are dropped. Rows are NOT stored (only their totals are):
+ * they are what the parser hands back for its own use and for tests.
  */
 export type CodexRun = {
-  /** The PR label (`acme/web-api#12`): outside text, cleaned of control characters and cut to 40. */
+  /** The PR label (`acme/web-api#12`) for display: outside text, cleaned of control characters and cut to 40; `…` for an e-mail address or a path. */
   label: string
   /** The row's UTC timestamp, ms since epoch. */
   at: number
@@ -151,15 +152,30 @@ export type CodexRun = {
 }
 
 /**
- * The Codex runs on this machine since this session started (rows at or after the
- * session's `startedAt`; the log has no session column, so a run from another terminal counts),
- * its own atom (key `codex`, shape `codex-1`). Nothing here is read from
- * `~/.codex`; the one source is the CSV, at a fixed path.
+ * One `codex-review.sh` launch this session made: a match key for the `--label` it was given and when the Bash
+ * call started (ms, cut down to the second, because the log's timestamps are whole seconds). It is how a log
+ * row is tied to THIS session: the log has no session column.
+ */
+export type CodexLaunch = {
+  /**
+   * What a log row's label is matched against: the label with control characters cleaned, whole (at most 200
+   * characters, no cut to 40). For an e-mail address or a path it is `h:` and a short hash of it, so nothing
+   * readable is stored.
+   */
+  key: string
+  at: number
+}
+
+/**
+ * The Codex runs THIS session launched, its own atom (key `codex`, shape `codex-3`). A log row counts
+ * only when a launch of the same label, made at or before the row's timestamp, claims it (see `parseCodex`);
+ * rows nobody claimed are another terminal's and are ignored. Nothing here is read from `~/.codex`; the
+ * one source is the CSV, at a fixed path. A stored `codex-1` value (machine-wide rows, no launches) is
+ * declined by the tag and, if one ever got through, repaired to empty. `codex-2` also held the latest rows
+ * (`runs`), which nothing draws: they are no longer stored, and a `codex-2` value is declined by its tag too.
  */
 export type MeterCodex = {
-  /** The latest rows, oldest first, at most 8. Skipped rows included. */
-  runs: CodexRun[]
-  /** Over EVERY session row read (at most the log's last 500 lines), skipped rows left out of `runs`. */
+  /** Over EVERY claimed row read (at most the log's last 500 records), skipped rows left out of the counts. */
   totals: {
     /** Rows that were not skipped. */
     runs: number
@@ -170,9 +186,11 @@ export type MeterCodex = {
     /** API-equivalent dollars: per run ((input - cached) * 2 + cached * 0.10 + output * 10) / 1e6. */
     usd: number
   }
-  /** When each plan run that finished with exit 0 ended (ms), whatever the session; at most 500. For the limit estimate only. */
+  /** When each plan run that finished with exit 0 ended (ms), whatever the session and whoever launched it; at most 500. For the limit estimate only: the limit is account-wide. */
   planDoneAt: number[]
-  /** The log is over 4 MiB, which `$.fs.read` refuses: `runs` and `totals` are the last good read, now stale. */
+  /** This session's launches, oldest first, at most 500. Kept across a hot reload (it is in the atom); a new process (`claude --resume`) starts with none. */
+  launches: CodexLaunch[]
+  /** The log is over 4 MiB, which `$.fs.read` refuses: `totals` are the last good read, now stale. */
   tooBig: boolean
 }
 
