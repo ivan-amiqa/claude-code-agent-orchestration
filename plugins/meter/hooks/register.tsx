@@ -1,14 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, Elements, EngineInterface, Register, RenderElement, Timer } from 'claude-code'
 
-import type { MeterAgent, MeterBucket, MeterData, MeterGroup, MeterPr, MeterPrFetch, MeterPrKind } from '../types'
+import type { CodexLimits, CodexRun, MeterAgent, MeterBucket, MeterCodex, MeterData, MeterGroup, MeterPr, MeterPrFetch, MeterPrKind } from '../types'
 
 // ---------------------------------------------------------------------------
 // ZERO MODEL TOKENS. This mod never asks a model anything, never adds a tool,
 // never touches a prompt and never rewrites a tool result. It reads numbers
 // the engine already reports (cost, context, usage, agent ids) and draws them.
 // The one thing it reads out of text is GitHub PR URLs in a Bash command and
-// its result (see `prUrlsIn`); nothing else from prompts or outputs.
+// its result (see `prUrlsIn`), and the word `codex-review` in a Bash command; nothing
+// else from prompts or outputs. The one file it reads is the Codex CSV (see below).
 // ---------------------------------------------------------------------------
 
 const PANE = 'meter'
@@ -45,6 +46,12 @@ const data = atom({ plugin: 'meter', key: 'data' } as const, EMPTY, { shape: 'me
 // never wipes them. Bump `ci-1` only when MeterPr itself changes.
 const EMPTY_CI: MeterPr[] = []
 const ciAtom = atom({ plugin: 'meter', key: 'ci' } as const, EMPTY_CI, { shape: 'ci-1' })
+
+// The Codex runs on this machine since this session started, read from the one local log `codex-review.sh`
+// writes (see the Codex block below). Its own atom and tag, so a bump of `data`
+// or `ci` never wipes it. Bump `codex-1` only when MeterCodex itself changes.
+const EMPTY_CODEX: MeterCodex = { runs: [], totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [], tooBig: false }
+const codexAtom = atom({ plugin: 'meter', key: 'codex' } as const, EMPTY_CODEX, { shape: 'codex-1' })
 
 const MAX_GROUPS = 12 // columns of the Dollars chart, step 1 alone included
 const MAX_AGENTS = 60
@@ -94,14 +101,22 @@ const usd = (n: number) => `$${n.toFixed(2)}`
 // Under 1k as is; k with no decimals; 1.1M style at and over a million.
 export const tokens = (n: number) => (n >= 999_500 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(Math.round(n)))
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
-export const truncate = (text: string, room: number): string => (text.length <= room ? text : `${text.slice(0, Math.max(0, room - 1))}…`)
+// Cut by code unit, but never between the two halves of an emoji: a lone surrogate is not text.
+export const truncate = (text: string, room: number): string => {
+  if (text.length <= room) return text
+  const cut = text.slice(0, Math.max(0, room - 1))
+  const last = cut.charCodeAt(cut.length - 1)
+
+  return `${last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut}…`
+}
 
 // Text from outside (PR titles, check names, agent names) may hold control
 // characters; the engine refuses a whole Pane tree that has one in a text
 // child. C0 (tab, newline, CR, ESC, BEL, NUL), DEL, C1 (U+009B is CSI) and the
-// bidi embedding / override / isolate marks all become a space.
+// zero-width and bidi marks (U+200B, U+200C, U+200E, U+200F, U+061C, U+202A-202E, U+2066-2069), line / paragraph
+// separators (U+2028, U+2029) and the BOM (U+FEFF) all become a space.
 // eslint-disable-next-line no-control-regex
-const CONTROL = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u061c\u200b\u200c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g
 export const clean = (s: string): string => s.replace(CONTROL, ' ')
 const MAX_NAME = 40
 /** An agent's name as stored and drawn: no control characters, at most 40 characters. */
@@ -169,13 +184,15 @@ function ciWorst(prs: MeterPr[]): string {
   return 'passing'
 }
 
-export function summary(d: MeterData, ci: MeterPr[]): string {
+export function summary(d: MeterData, ci: MeterPr[], codex: MeterCodex = EMPTY_CODEX): string {
   const c = cacheInfo(d)
   const cache = c.state === 'none' ? 'cache n/a' : c.state === 'cold' ? 'cache cold' : `cache ${c.state} ${leftShort(c.leftMs)}`
   const agents = d.agents.length > 0 ? ` · ${d.agents.length} agent${d.agents.length === 1 ? '' : 's'}` : ''
   const prs = ci.length > 0 ? ` · CI: ${ci.length} PR${ci.length === 1 ? '' : 's'}, ${ciWorst(ci)}` : ''
 
-  return `Session ${usd(d.costUsd)} · context ${tokens(d.contextTokens)} · ${cache}${agents}${prs}`
+  const cx = codex.totals.runs > 0 ? ` · Codex ${codex.totals.runs} run${codex.totals.runs === 1 ? '' : 's'} ≈${usd(codex.totals.usd)} API-eq` : ''
+
+  return `Session ${usd(d.costUsd)} · context ${tokens(d.contextTokens)} · ${cache}${agents}${prs}${cx}`
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +494,352 @@ async function commitCi($: Dollar, change: (ci: MeterPr[]) => MeterPr[]): Promis
   return update($, ciAtom, c => sanePrs(change(sanePrs(c))))
 }
 
+// ---------------------------------------------------------------------------
+// Codex: the `codex-review.sh` runs on this machine since this session started, read from ONE local
+// log (it has no session column, so a run from another terminal counts too).
+//
+// The ONLY file this mod reads is `${HOME}/.amiqa/codex-review-runs.csv` (a
+// constant; no input ever builds a path). It never reads `~/.codex`, never starts
+// a `codex` process, never calls the network. The log is treated as untrusted
+// text (a label comes from a PR title): control characters go, the label is cut.
+// Its `user` (an email), `repo` / `out_dir` (local paths) and the SHAs are
+// dropped AT PARSE TIME, so they are never stored, drawn or put in a reply.
+// ---------------------------------------------------------------------------
+export const CODEX_CSV = '.amiqa/codex-review-runs.csv'
+export const CODEX_LIMITS_KEY = 'codex-limits-1'
+export const CODEX_PCT_PER_REVIEW = 0.6 // % of the weekly allowance one plan review costs (the author's rough reading, not a published number)
+export const CODEX_USAGE_URL = 'https://chatgpt.com/settings/usage'
+const MAX_CODEX_RUNS = 8 // rows drawn; the totals count every row read
+const MAX_CODEX_LINES = 500 // the log's last lines looked at
+const MAX_CODEX_PLAN = 500
+const CODEX_AUTH = ['plan', 'api', 'none'] as const
+
+/** One RFC-4180 parser: quotes, `""`, commas and line breaks inside quotes, CRLF. Blank lines come back as `['']`. */
+export function parseCsv(text: string): string[][] {
+  const out: string[][] = []
+  let row: string[] = []
+  let field = ''
+  let quoted = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charAt(i)
+    if (quoted) {
+      if (c !== '"') field += c
+      else if (text.charAt(i + 1) === '"') {
+        field += '"'
+        i++
+      } else quoted = false
+    } else if (c === '"' && field === '') quoted = true
+    else if (c === ',') {
+      row.push(field)
+      field = ''
+    } else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text.charAt(i + 1) === '\n') i++
+      row.push(field)
+      out.push(row)
+      row = []
+      field = ''
+    } else field += c
+  }
+  if (field !== '' || row.length > 0) out.push([...row, field])
+
+  return out
+}
+
+/** `codex-review.sh` puts a `'` in front of a field that starts with `= + @ - TAB`; take it off again. */
+const unguard = (v: string): string => (v.length > 1 && v.startsWith("'") && '=+@-\t'.includes(v.charAt(1)) ? v.slice(1) : v)
+/** A count from the log: digits only, at most 12 of them; anything else is 0. */
+const codexNum = (v: string): number => (/^[0-9]{1,12}(?:\.[0-9]+)?$/.test(v.trim()) ? Math.round(Number(v)) : 0)
+
+/** API-equivalent dollars of one run at gpt-6.1-sol's list prices: $2 in / $0.10 cached / $10 out per million tokens (not checked against OpenAI's price page). */
+export const codexCost = (input: number, cached: number, output: number): number => {
+  const i = Math.max(0, fin(input, 0))
+  const c = Math.max(0, fin(cached, 0))
+  const o = Math.max(0, fin(output, 0))
+  const fresh = Math.max(0, i - c)
+
+  return (fresh * 2 + c * 0.1 + o * 10) / 1_000_000
+}
+
+/**
+ * The CSV's text as the Codex runs on this machine since `startedAt`. Columns are found by their HEADER NAME,
+ * so a new column never moves anything; the last 500 records at most; a row that is short, garbled or before
+ * `startedAt` is skipped (the plan-run times, kept for the limit estimate, ignore `startedAt`).
+ */
+export function parseCodex(text: string, startedAt: number): MeterCodex {
+  const firstBreak = text.indexOf('\n')
+  if (firstBreak < 0) return EMPTY_CODEX
+  const header = parseCsv(text.slice(0, firstBreak).replace(/^\uFEFF/, ''))[0] ?? []
+  const col = new Map<string, number>()
+  header.forEach((h, i) => {
+    const name = h.trim().toLowerCase()
+    if (!col.has(name)) col.set(name, i)
+  })
+  const idx = (name: string): number => col.get(name) ?? -1
+  if (idx('timestamp') < 0 || idx('auth') < 0 || idx('label') < 0) return EMPTY_CODEX
+  const need = Math.max(...['timestamp', 'label', 'auth', 'fell_back', 'duration_s', 'exit_code', 'input_tokens', 'cached_input_tokens', 'output_tokens'].map(idx)) + 1
+  // Whole text first, then the last 500 RECORDS: a cut in the middle of a quoted field (a label ending in a
+  // line break) would otherwise swallow every row after it. The file is at most 4 MiB.
+  const records = parseCsv(text.slice(firstBreak + 1))
+    .filter(r => !(r.length === 1 && r[0] === ''))
+    .slice(-MAX_CODEX_LINES)
+
+  const runs: CodexRun[] = []
+  const totals = { ...EMPTY_CODEX.totals }
+  const planDoneAt: number[] = []
+  for (const r of records) {
+    if (r.length < need) continue
+    const get = (name: string): string => {
+      const i = idx(name)
+
+      return i < 0 ? '' : unguard(r[i] ?? '').trim()
+    }
+    const stamp = get('timestamp')
+    const at = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(stamp) ? Date.parse(stamp) : Number.NaN
+    const auth = CODEX_AUTH.find(a => a === get('auth').toLowerCase())
+    if (!Number.isFinite(at) || auth === undefined) continue
+    const exit = get('exit_code')
+    const exitCode = /^[0-9]{1,4}$/.test(exit) ? Number(exit) : null
+    const skip = truncate(clean(get('skip_reason')), 24)
+    if (auth === 'plan' && exitCode === 0 && skip === '' && planDoneAt.length < MAX_CODEX_PLAN) planDoneAt.push(at)
+    if (at < startedAt) continue
+    const run: CodexRun = {
+      label: agentName(get('label')) || 'review',
+      at,
+      durationS: codexNum(get('duration_s')),
+      input: codexNum(get('input_tokens')),
+      cached: codexNum(get('cached_input_tokens')),
+      output: codexNum(get('output_tokens')),
+      auth,
+      fellBack: get('fell_back').toLowerCase() === 'yes',
+      exitCode,
+      skip,
+    }
+    runs.push(run)
+    if (skip === '') {
+      totals.runs++
+      totals.durationS += run.durationS
+      totals.input += run.input
+      totals.cached += run.cached
+      totals.output += run.output
+      totals.usd += codexCost(run.input, run.cached, run.output)
+    }
+  }
+
+  return { runs: runs.slice(-MAX_CODEX_RUNS), totals, planDoneAt, tooBig: false }
+}
+
+/** The stored Codex value, repaired: a bad row dropped, every number finite and not negative, the label cleaned again. */
+export function saneCodex(raw: unknown): MeterCodex {
+  const r = isRec(raw) ? raw : {}
+  const t = isRec(r.totals) ? r.totals : {}
+  const count = (v: unknown): number => Math.max(0, fin(v, 0))
+  const runs = rows(r.runs).flatMap((x): CodexRun[] =>
+    typeof x.label === 'string'
+      ? [
+          {
+            label: agentName(x.label) || 'review',
+            at: count(x.at),
+            durationS: count(x.durationS),
+            input: count(x.input),
+            cached: count(x.cached),
+            output: count(x.output),
+            auth: pick(x.auth, CODEX_AUTH, 'none'),
+            fellBack: x.fellBack === true,
+            exitCode: finOrNull(x.exitCode),
+            skip: truncate(clean(strOr(x.skip)), 24),
+          },
+        ]
+      : [],
+  )
+
+  return {
+    runs: runs.slice(-MAX_CODEX_RUNS),
+    totals: { runs: count(t.runs), durationS: count(t.durationS), input: count(t.input), cached: count(t.cached), output: count(t.output), usd: count(t.usd) },
+    tooBig: r.tooBig === true,
+    planDoneAt: (Array.isArray(r.planDoneAt) ? r.planDoneAt : []).filter((n): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0).slice(-MAX_CODEX_PLAN),
+  }
+}
+
+async function readCodex($: Dollar): Promise<MeterCodex> {
+  return saneCodex(await read($, codexAtom))
+}
+
+// -- reading the file: only when it changed, only this path -------------------
+let codexKey = '' // `${mtimeMs}:${size}:${startedAt}` of the last look
+let codexBusy = false
+let codexPending = false // a refresh was asked for while one ran: one more follows
+let codexLastReadAt = 0
+const MAX_CODEX_BYTES = 4 * 1024 * 1024 // `$.fs.read` refuses a file over 4 MiB
+
+/**
+ * Re-reads the CSV when its modification time, its size or the session start changed. A missing
+ * file empties the section, with no error. A file over 4 MiB is not read (the engine refuses it):
+ * the last good rows stay, marked stale, until it shrinks. Never throws.
+ */
+async function refreshCodex($: Dollar): Promise<void> {
+  if (codexBusy) {
+    codexPending = true
+
+    return
+  }
+  codexBusy = true
+  try {
+    const home = await $.env.get('HOME')
+    if (typeof home !== 'string' || !home.startsWith('/')) return
+    const path = `${home.replace(/\/+$/, '')}/${CODEX_CSV}`
+    const startedAt = (await $.session.usage()).startedAt
+    if (typeof startedAt !== 'number' || !Number.isFinite(startedAt)) return
+    let stat: { mtimeMs: number; size: number }
+    try {
+      stat = await $.fs.stat(path)
+    } catch {
+      const key = `missing:${startedAt}`
+      if (key !== codexKey) {
+        codexKey = key
+        await update($, codexAtom, () => EMPTY_CODEX)
+      }
+
+      return
+    }
+    const key = `${stat.mtimeMs}:${stat.size}:${startedAt}`
+    if (key === codexKey) return
+    codexKey = key // also when the read below fails: no new read until the file changes
+    if (stat.size > MAX_CODEX_BYTES) {
+      await update($, codexAtom, c => ({ ...saneCodex(c), tooBig: true }))
+
+      return
+    }
+    const parsed = parseCodex(await $.fs.read(path), startedAt)
+    await update($, codexAtom, () => parsed)
+  } catch {
+    // reading is a courtesy; a failed read leaves what the pane has
+  } finally {
+    codexBusy = false
+    if (codexPending) {
+      codexPending = false
+      void refreshCodex($)
+    }
+  }
+}
+
+// -- the plan limit, typed in by hand ------------------------------------------
+const DAY_MS = 24 * 60 * MIN
+const HOUR_MS = 60 * MIN
+
+/** `6d2h`, `2h10m`, `45m`: days, hours, minutes in that order, at least one, more than 0 and at most `maxMs`. */
+export function parseDuration(text: string, maxMs: number): number | undefined {
+  const m = /^(?:([0-9]{1,3})d)?(?:([0-9]{1,3})h)?(?:([0-9]{1,3})m)?$/i.exec(text)
+  if (m === null || text === '') return undefined
+  if (Number(m[3] ?? 0) >= 60 || (m[1] !== undefined && Number(m[2] ?? 0) >= 24)) return undefined // 1h60m is not a way to say 2h
+  const ms = Number(m[1] ?? 0) * DAY_MS + Number(m[2] ?? 0) * HOUR_MS + Number(m[3] ?? 0) * MIN
+
+  return ms > 0 && ms <= maxMs ? ms : undefined
+}
+
+/** `97`, `97.5`, `0`, `100`: a percent from 0 to 100. */
+export function parsePercent(text: string): number | undefined {
+  if (!/^[0-9]{1,3}(?:\.[0-9])?$/.test(text)) return undefined
+  const n = Number(text)
+
+  return n >= 0 && n <= 100 ? n : undefined
+}
+
+export type CodexEntry = { weekPct: number; weekMs: number; fiveHPct: number | null; fiveHMs: number | null }
+export const CODEX_USAGE_HINT = 'Usage: /meter codex <pct> <reset> [5h=<pct> 5hreset=<dur>], e.g. /meter codex 97 6d2h'
+
+/** What follows `/meter codex`: nothing (show), `<pct> <reset>` with optional `5h=` and `5hreset=` together, or undefined for anything else. */
+export function parseCodexArgs(rest: string): CodexEntry | 'show' | undefined {
+  const t = rest.trim() === '' ? [] : rest.trim().split(/\s+/)
+  if (t.length === 0) return 'show'
+  if (t.length !== 2 && t.length !== 4) return undefined
+  const weekPct = parsePercent(t[0] ?? '')
+  const weekMs = parseDuration(t[1] ?? '', 7 * DAY_MS)
+  if (weekPct === undefined || weekMs === undefined) return undefined
+  let fiveHPct: number | null = null
+  let fiveHMs: number | null = null
+  for (const x of t.slice(2)) {
+    const m = /^(5h|5hreset)=(.+)$/i.exec(x)
+    if (m === null) return undefined
+    if (m[1]?.toLowerCase() === '5h') {
+      const p = parsePercent(m[2] ?? '')
+      if (p === undefined || fiveHPct !== null) return undefined
+      fiveHPct = p
+    } else {
+      const d = parseDuration(m[2] ?? '', 5 * HOUR_MS)
+      if (d === undefined || fiveHMs !== null) return undefined
+      fiveHMs = d
+    }
+  }
+  if (t.length === 4 && (fiveHPct === null || fiveHMs === null)) return undefined
+
+  return { weekPct, weekMs, fiveHPct, fiveHMs }
+}
+
+/** The stored limits, repaired; undefined when they are missing or not usable. */
+export function saneLimits(raw: unknown): CodexLimits | undefined {
+  if (!isRec(raw)) return undefined
+  const pct = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 ? v : null)
+  const weekPct = pct(raw.weekPct)
+  const weekResetAt = finOrNull(raw.weekResetAt)
+  const enteredAt = finOrNull(raw.enteredAt)
+  // Times must make sense, or the whole value is dropped: entered after 0, the week resets within 7 days of it.
+  if (weekPct === null || weekResetAt === null || enteredAt === null) return undefined
+  if (!(enteredAt > 0) || weekResetAt < enteredAt || weekResetAt > enteredAt + 7 * DAY_MS) return undefined
+  const fiveHPct = pct(raw.fiveHPct)
+  const fiveHResetAt = finOrNull(raw.fiveHResetAt)
+  const both = fiveHPct !== null && fiveHResetAt !== null && fiveHResetAt >= enteredAt && fiveHResetAt <= enteredAt + 5 * HOUR_MS
+
+  return { weekPct, weekResetAt, enteredAt, fiveHPct: both ? fiveHPct : null, fiveHResetAt: both ? fiveHResetAt : null }
+}
+
+async function readLimits($: Dollar): Promise<CodexLimits | undefined> {
+  try {
+    return saneLimits(await $.store.get(CODEX_LIMITS_KEY))
+  } catch {
+    return undefined
+  }
+}
+
+const pctText = (n: number): string => String(Number(n.toFixed(1)))
+const two = (n: number) => String(n).padStart(2, '0')
+const WEEKDAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+/** `Sun 15/11 12:20` in the machine's own time zone; `clockOnly` leaves the day out. */
+export function resetText(ms: number, clockOnly = false): string {
+  const d = new Date(ms)
+  const time = `${two(d.getHours())}:${two(d.getMinutes())}`
+
+  return clockOnly ? time : `${WEEKDAY[d.getDay()] ?? ''} ${two(d.getDate())}/${two(d.getMonth() + 1)} ${time}`
+}
+export function agoText(ms: number): string {
+  const m = Math.floor(Math.max(0, ms) / MIN)
+
+  return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : m < 48 * 60 ? `${Math.floor(m / 60)}h ago` : `${Math.floor(m / (24 * 60))}d ago`
+}
+
+/**
+ * The weekly percentage left NOW, estimated: what was typed minus ~0.6% for each plan review that
+ * finished since. undefined once the week has reset (the number would be old).
+ */
+export function codexEstimate(limits: CodexLimits, codex: MeterCodex, now: number): { pct: number; reviews: number } | undefined {
+  if (now >= limits.weekResetAt) return undefined
+  const reviews = codex.planDoneAt.filter(t => t > limits.enteredAt).length
+
+  return { pct: Math.max(0, limits.weekPct - reviews * CODEX_PCT_PER_REVIEW), reviews }
+}
+
+/** The one-line answer of `/meter codex`. */
+export function limitsLine(limits: CodexLimits | undefined, codex: MeterCodex, now: number): string {
+  if (limits === undefined) return 'Codex plan limit: not set. /meter codex <pct> <reset>, e.g. /meter codex 97 6d2h'
+  // Once a window has reset its old percentage is not shown at all.
+  const fiveSet = limits.fiveHPct !== null && limits.fiveHResetAt !== null
+  const five = !fiveSet ? '' : now >= (limits.fiveHResetAt ?? 0) ? ' · 5h has reset, enter a new value' : ` · 5h: ${pctText(limits.fiveHPct ?? 0)}% left, resets ${resetText(limits.fiveHResetAt ?? 0, true)}`
+  if (now >= limits.weekResetAt) return `Codex plan: week has reset, enter a new value (/meter codex <pct> <reset>)${five}`
+  const est = codexEstimate(limits, codex, now)
+  const estText = est === undefined ? '' : ` (≈${pctText(est.pct)}% now)`
+
+  return `Codex plan: ${pctText(limits.weekPct)}% week left${estText}, resets ${resetText(limits.weekResetAt)}${five} · entered ${agoText(now - limits.enteredAt)}`
+}
+
 function withContext(d: MeterData, tokensNow: number): MeterData {
   const level = tokensNow > BAD_AT ? 500 : tokensNow >= WARN_AT ? 350 : 0
 
@@ -725,6 +1088,10 @@ async function tick($: Dollar): Promise<void> {
 
         return { ...x, nowMs: now, coldToasted: x.coldToasted || (cold && inFlight === 0) }
       })
+    }
+    if (now - codexLastReadAt >= MIN) {
+      codexLastReadAt = now
+      void refreshCodex($) // stat first: an unchanged file is not read again
     }
     if (now - lastCiPollAt >= MIN) {
       // Only while something is pending: a PR not read yet, one with checks still
@@ -1858,6 +2225,115 @@ function dollarsSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   )
 }
 
+// -- 6b. Codex: the reviews on this machine since this session started ------
+// Tokens as the log counts them: `2.8k` under 10k, then `241k`, `1.1M`.
+const codexTokens = (n: number): string => (n >= 1000 && n < 10_000 ? `${(n / 1000).toFixed(1)}k` : tokens(n))
+/** `54s`, `3m26s`, `1h02m`. */
+export const codexDuration = (s: number): string => (s < 60 ? `${Math.round(s)}s` : s < 3600 ? `${Math.floor(s / 60)}m${Math.round(s % 60)}s` : `${Math.floor(s / 3600)}h${two(Math.floor((s % 3600) / 60))}m`)
+
+/**
+ * One run as text: `label · 3m26s · 241k in (199k cached) · 6.1k out · plan` plus ` · ↪ fell back` when it did,
+ * and the cost to its right (`≈$0.16 if API` on a plan run, where nothing was billed; `≈$0.16` on an API run).
+ * It is one line when it fits `room` characters. When it does not, the head keeps the label and the duration
+ * (the label is cut first), the cost says `API-eq` instead of `if API`, and the rest moves to muted lines under it
+ * (nothing is dropped). A skipped or failed run is one muted line with its reason; a skipped run has no cost.
+ */
+export function codexRow(r: CodexRun, room: number): { head: string; details: string[]; cost: string; muted: boolean } {
+  const base = r.skip === '' && r.input + r.output > 0 ? `≈${usd(codexCost(r.input, r.cached, r.output))}` : ''
+  const plan = base !== '' && r.auth === 'plan' // nothing was billed on a plan run: say so
+  const reason = r.skip !== '' ? `skip: ${r.skip}` : r.exitCode !== null && r.exitCode !== 0 ? `exit ${r.exitCode}` : undefined
+  const budgetFor = (cost: string) => Math.max(8, room - cost.length - 1)
+  const long = plan ? `${base} if API` : base
+  const short = plan ? `${base} API-eq` : base
+  if (reason !== undefined) {
+    const tail = ` · ${reason}`
+
+    return { head: `${truncate(r.label, Math.max(4, budgetFor(short) - tail.length))}${tail}`, details: [], cost: short, muted: true }
+  }
+  const fb = r.fellBack ? ' · ↪ fell back' : ''
+  const tokensText = `${codexTokens(r.input)} in (${codexTokens(r.cached)} cached) · ${codexTokens(r.output)} out`
+  const full = `${r.label} · ${codexDuration(r.durationS)} · ${tokensText} · ${r.auth}${fb}`
+  if (full.length <= budgetFor(long)) return { head: full, details: [], cost: long, muted: false }
+  const tail = ` · ${codexDuration(r.durationS)}`
+  const how = `${r.auth}${fb}`
+  const joined = `${how} · ${tokensText}`
+
+  return {
+    head: `${truncate(r.label, Math.max(4, budgetFor(short) - tail.length))}${tail}`,
+    details: joined.length <= room ? [joined] : [tokensText, how],
+    cost: short,
+    muted: false,
+  }
+}
+
+function codexSection(k: Kit, l: Layout, codex: MeterCodex, limits: CodexLimits | undefined, now: number): RenderElement | null {
+  const { Box, Text, Link } = k
+  if (codex.runs.length === 0 && !codex.tooBig) return null
+  const t = codex.totals
+  const room = Math.max(8, l.width - 2)
+  // The log is over what `$.fs.read` takes: the rows below are the last good read.
+  const stale = codex.tooBig ? caption(k, `Codex log over 4 MB, rotate ~/${CODEX_CSV}`) : null
+  if (codex.runs.length === 0) return section(k, 'Codex', stale)
+  const lines: RenderElement[] = codex.runs.map(r => {
+    const row = codexRow(r, room)
+
+    return (
+      <Box flexDirection="column" width={l.width}>
+        <Box justifyContent="space-between" width={l.width}>
+          <Text dimColor={row.muted} wrap="truncate-end">
+            {row.head}
+          </Text>
+          {row.cost === '' ? null : <Text dimColor>{row.cost}</Text>}
+        </Box>
+        {row.details.map(line => (
+          <Text size="caption" dimColor wrap="truncate-end">
+            {truncate(line, room)}
+          </Text>
+        ))}
+      </Box>
+    )
+  })
+  const est = limits === undefined ? undefined : codexEstimate(limits, codex, now)
+  const weekLeft = limits !== undefined && now < limits.weekResetAt
+  const planLine =
+    limits === undefined ? (
+      caption(k, truncate('Plan limit: /meter codex <pct> <reset>', room))
+    ) : (
+      <Text wrap="truncate-end">
+        {truncate(weekLeft ? `Plan: ${pctText(limits.weekPct)}% week left · resets ${resetText(limits.weekResetAt)} · entered ${agoText(now - limits.enteredAt)}` : 'Plan: week has reset, enter a new value (/meter codex …)', room)}
+      </Text>
+    )
+  const fiveLine =
+    limits !== undefined && limits.fiveHPct !== null && limits.fiveHResetAt !== null ? (
+      <Text wrap="truncate-end">
+        {truncate(now < limits.fiveHResetAt ? `5h: ${pctText(limits.fiveHPct)}% left · resets ${resetText(limits.fiveHResetAt, true)}` : '5h: has reset, enter a new value', room)}
+      </Text>
+    ) : null
+
+  return section(
+    k,
+    'Codex',
+    stale,
+    <Box flexDirection="column">
+      {big(k, `≈${usd(t.usd)}`)}
+      {caption(k, 'since session start')}
+      {caption(k, `API-equivalent · ${t.runs} run${t.runs === 1 ? '' : 's'} · ${Math.max(t.durationS > 0 ? 1 : 0, Math.round(t.durationS / 60))} min`)}
+    </Box>,
+    <Box flexDirection="column" marginTop={1} width={l.width}>
+      {lines}
+    </Box>,
+    t.runs > 0 ? <Box marginTop={1}>{caption(k, truncate(`total ${codexTokens(t.input)} in · ${codexTokens(t.cached)} cached · ${codexTokens(t.output)} out · ≈${usd(t.usd)}`, room))}</Box> : null,
+    <Box flexDirection="column" marginTop={1} width={l.width}>
+      {planLine}
+      {fiveLine}
+      {est === undefined ? null : caption(k, truncate(`≈ ${pctText(est.pct)}% now (${est.reviews} plan review${est.reviews === 1 ? '' : 's'} since × ~${CODEX_PCT_PER_REVIEW}%)`, room))}
+      <Text size="caption">
+        <Link href={CODEX_USAGE_URL} label="chatgpt.com/settings/usage" />
+      </Text>
+    </Box>,
+  )
+}
+
 // -- 7. Guard ---------------------------------------------------------------
 function guardSection(k: Kit, d: MeterData): RenderElement {
   const { Box, Text } = k
@@ -1888,6 +2364,28 @@ async function note($: Dollar, kind: 'blocked' | 'switched', text: string, toast
   }
 }
 
+/** `/meter codex ...`: store what was typed (strictly checked) or show what is stored. One line, always. */
+async function codexCommand($: Dollar, rest: string, now: number): Promise<string> {
+  const parsed = parseCodexArgs(rest)
+  if (parsed === undefined) return CODEX_USAGE_HINT
+  const codex = await readCodex($)
+  if (parsed === 'show') return limitsLine(await readLimits($), codex, now)
+  const limits: CodexLimits = {
+    weekPct: parsed.weekPct,
+    weekResetAt: now + parsed.weekMs,
+    fiveHPct: parsed.fiveHPct,
+    fiveHResetAt: parsed.fiveHMs === null ? null : now + parsed.fiveHMs,
+    enteredAt: now,
+  }
+  try {
+    await $.store.set(CODEX_LIMITS_KEY, limits)
+  } catch {
+    return 'Meter: could not save the Codex plan limit.'
+  }
+
+  return `Saved. ${limitsLine(limits, codex, now)}`
+}
+
 const NO_NESTING = 'Meter: no nested agents — return to the main session.'
 
 export const register: Register = (on, options) => {
@@ -1897,15 +2395,19 @@ export const register: Register = (on, options) => {
     await registerCommand($) // awaited: listed by the first prompt; never throws
     void $.ui.open({ id: PANE, title: TITLE }).catch(() => undefined)
     ensureTicker($)
+    await refreshCodex($) // never throws; the pane shows the section only if Codex ran on this machine since this session started
 
     return next(e)
   })
 
-  on('command.run', { command: 'meter' }, async $ => {
+  on('command.run', { command: 'meter' }, async ($, input) => {
     await $.ui.open({ id: PANE, title: TITLE }).catch(() => undefined)
     ensureMeter($)
     await refreshTheme($) // the person may have changed it since the pane last drew
     const now = await readNow($)
+    await refreshCodex($)
+    const codexArgs = /^codex(?:\s+([\s\S]*))?$/i.exec(input.args.trim())
+    if (codexArgs !== null) return { text: await codexCommand($, codexArgs[1] ?? '', now) }
     const u = await readUsage($)
     const d = await commit($, x => {
       const y: MeterData = { ...x, nowMs: now, costUsd: u?.usd ?? x.costUsd }
@@ -1920,7 +2422,7 @@ export const register: Register = (on, options) => {
       .map(p => p.url)
     scheduleCiRefresh($, stale)
 
-    return { text: summary(d, ci) }
+    return { text: summary(d, ci, await readCodex($)) }
   })
 
   // Read-only: the theme is only noticed, never denied or changed. The pane
@@ -1943,6 +2445,9 @@ export const register: Register = (on, options) => {
     try {
       const d = await readData($) // never the raw stored value
       const ci = await readCi($)
+      const codex = await readCodex($)
+      const limits = codex.runs.length > 0 ? await readLimits($) : undefined
+      const nowMs = await readNow($)
       const columns = e.props.bodyColumns ?? 40
       // Scale the charts to the room (up to 120 cells). Where the surface has
       // `Svg` they are drawn at 8 px a cell, in the palette of the person's theme.
@@ -1959,6 +2464,7 @@ export const register: Register = (on, options) => {
           {topSection(k, layout, d)}
           {workSection(k, layout, d)}
           {ciSection(k, layout, ci)}
+          {codexSection(k, layout, codex, limits, nowMs)}
           {dollarsSection(k, layout, d)}
           {guardSection(k, d)}
         </Box>
@@ -2248,6 +2754,8 @@ export const register: Register = (on, options) => {
         if (fromGh !== undefined) urls.push(fromGh)
         await noteSeenPrs($, urls)
       }
+      // A review the main thread or a subagent just ran has written its CSV row by now.
+      if (/codex-review/.test(e.command)) await refreshCodex($)
     } catch {
       // detecting never fails a Bash call
     }

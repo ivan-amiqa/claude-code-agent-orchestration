@@ -5,7 +5,7 @@ import type { On } from 'claude-code'
 
 import type { MeterData, MeterGroup, MeterPr } from '../types'
 
-import { addToGroups, agentRow, barSvg, beforeLoaded, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, niceTicks, niceTop, PALETTES, paletteFor, PRICE_RATIO, prUrlsIn, ringSvg, rollup, sane, sanePrs, shares, splitCost, splitParts, stackCells, tokens, truncate } from './register'
+import { addToGroups, agentRow, agoText, barSvg, beforeLoaded, codexCost, codexDuration, codexEstimate, codexRow, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, clean, niceTicks, niceTop, PALETTES, paletteFor, parseCodex, parseCodexArgs, parseCsv, parseDuration, parsePercent, PRICE_RATIO, prUrlsIn, resetText, saneCodex, saneLimits, ringSvg, rollup, sane, sanePrs, shares, splitCost, splitParts, stackCells, tokens, truncate } from './register'
 
 const PANE = {
   plugin: 'meter',
@@ -2619,4 +2619,678 @@ test('Dollars per step is a quarter shorter in the docked pane and keeps its ful
   expect(await heightAt(44)).toBe(135)
   expect(await heightAt(62)).toBe(135)
   expect(await heightAt(100)).toBe(180)
+})
+
+// ---------------------------------------------------------------------------
+// Codex: this session's `codex-review.sh` runs, from ONE local CSV
+// (test data is scrubbed: acme labels, example.com, made-up paths)
+// ---------------------------------------------------------------------------
+const CODEX_HEADER = 'timestamp,user,label,repo,head_sha,auth,fell_back,limit_signal,duration_s,exit_code,input_tokens,cached_input_tokens,output_tokens,est_api_cost_usd,out_dir,base_sha,effort,risk,skip_reason'
+const T0 = Date.parse('2026-11-09T09:00:00Z')
+const CODEX_PATH = '/home/tester/.amiqa/codex-review-runs.csv'
+const FAKE_EMAIL = 'dev@example.com'
+const FAKE_PATH = '/Users/jdoe/src/web-api'
+
+const close = (a: number, b: number, tol = 0.0005) => Math.abs(a - b) <= tol
+const csvField = (v: string) => (/[,"\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v)
+const csvRow = (over: Record<string, string> = {}, columns = CODEX_HEADER.split(',')) => {
+  const base: Record<string, string> = {
+    timestamp: '2026-11-09T09:00:00Z',
+    user: FAKE_EMAIL,
+    label: 'acme/web-api#12',
+    repo: FAKE_PATH,
+    head_sha: '0123456789abcdef0123456789abcdef01234567',
+    auth: 'plan',
+    fell_back: 'no',
+    limit_signal: '',
+    duration_s: '206',
+    exit_code: '0',
+    input_tokens: '428723',
+    cached_input_tokens: '382208',
+    output_tokens: '2758',
+    est_api_cost_usd: '',
+    out_dir: '/Users/jdoe/tmp/out',
+    base_sha: 'fedcba9876543210fedcba9876543210fedcba98',
+    effort: 'high',
+    risk: 'high',
+    skip_reason: '',
+  }
+  const all = { ...base, ...over }
+
+  return columns.map(c => csvField(all[c] ?? '')).join(',')
+}
+const csvOf = (...rowsIn: string[]) => `${CODEX_HEADER}\n${rowsIn.join('\n')}\n`
+const at = (minutes: number) => new Date(T0 + minutes * MIN).toISOString().replace('.000Z', 'Z')
+
+type CodexWorld = { csv: string | undefined; mtime: number; size: number | undefined; failRead: boolean; gate: Promise<void> | undefined; stats: string[]; reads: string[]; others: string[]; startedAt: number }
+/** The fs, env, store and session beneath the plugin for a Codex test; the clock sits 10 minutes after T0. */
+const codexSetup = (on: On, world: Partial<CodexWorld> = {}, entries: Record<string, unknown> = {}) => {
+  const w: CodexWorld = { csv: undefined, mtime: 1, size: undefined, failRead: false, gate: undefined, stats: [], reads: [], others: [], startedAt: T0 - MIN, ...world }
+  quiet(on)
+  const clock = mock.clock(on, { now: T0 + 10 * MIN })
+  mock.env(on, { HOME: '/home/tester' })
+  const store = new Map<string, unknown>(Object.entries(entries))
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => {
+    store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+
+    return { value: undefined }
+  })
+  on('command.register', () => ({ value: { command: 'meter' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.usage', () => ({ value: { startedAt: w.startedAt, context: { tokens: 1000, window: 1_000_000 }, rateLimits: [], cost: { usd: 1 } } }))
+  on('fs.stat', async (_, e) => {
+    w.stats.push(e.path)
+    const gate = w.gate
+    const mtimeMs = w.mtime
+    if (gate !== undefined) await gate
+    if (w.csv === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+
+    return { value: { kind: 'file' as const, size: w.size ?? w.csv.length, mtimeMs, isLink: false } }
+  })
+  on('fs.read', (_, e) => {
+    w.reads.push(e.path)
+    if (w.failRead) throw new Error('too big for the engine')
+
+    return { value: w.csv ?? '' }
+  })
+  const other = (name: string) => () => {
+    w.others.push(name)
+
+    return { value: undefined } as never
+  }
+  on('fs.write', other('fs.write'))
+  on('fs.list', other('fs.list'))
+  on('fs.exists', other('fs.exists'))
+  on('fs.ancestors', other('fs.ancestors'))
+  on('tool.call', () => ({ result: {}, text: '' }))
+
+  return { w, clock, store }
+}
+const startSession = ($: Engine) => $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+const runMeter = ($: Engine, args: string) =>
+  $.command.run({ command: 'meter', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+const allText = async (ui: Tree) => (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+
+test('parseCsv: quotes, doubled quotes, commas and line breaks inside quotes, CRLF, blank lines', () => {
+  expect(parseCsv('a,b\r\n"x,1","he said ""hi"""\r\n"two\nlines",z\n\nlast,')).toEqual([
+    ['a', 'b'],
+    ['x,1', 'he said "hi"'],
+    ['two\nlines', 'z'],
+    [''],
+    ['last', ''],
+  ])
+  expect(parseCsv('')).toEqual([])
+  expect(parseCsv('a"b,c')).toEqual([['a"b', 'c']]) // a quote inside an unquoted field is a plain character
+})
+
+test('codexCost: the 428723 / 382208 / 2758 row is about $0.159, and a cache bigger than the input never goes negative', () => {
+  expect(close(codexCost(428_723, 382_208, 2_758), 0.0930 + 0.0382 + 0.0276)).toBe(true)
+  expect(close(codexCost(428_723, 382_208, 2_758), 0.159)).toBe(true)
+  expect(close(codexCost(1_000, 5_000, 0), (5_000 * 0.1) / 1e6, 1e-9)).toBe(true) // input - cached clamps at 0
+  expect(close(codexCost(Number.NaN, -5, 10), 0.0001, 1e-9)).toBe(true)
+})
+
+test('parseCodex finds columns by header name: a reordered file with an extra column reads the same', () => {
+  const cols = ['skip_reason', 'extra_new_column', ...CODEX_HEADER.split(',').reverse()]
+  const text = `${cols.join(',')}\n${csvRow({ extra_new_column: 'x' }, cols)}\n`
+  const out = parseCodex(text, 0)
+
+  expect(out.runs).toHaveLength(1)
+  expect(out.runs[0]).toMatchObject({ label: 'acme/web-api#12', auth: 'plan', durationS: 206, input: 428_723, cached: 382_208, output: 2_758, exitCode: 0, fellBack: false, skip: '' })
+  expect(out.totals.runs).toBe(1)
+  expect(close(out.totals.usd, 0.159)).toBe(true)
+})
+
+test('parseCodex drops user, repo, out_dir and the SHAs at parse time: nothing of them is in what it returns', () => {
+  const out = parseCodex(csvOf(csvRow(), csvRow({ label: 'acme/web-api#13' })), 0)
+  const json = JSON.stringify(out)
+
+  expect(json).not.toContain('@')
+  expect(json).not.toContain('/Users/')
+  expect(json).not.toContain('0123456789abcdef')
+  expect(json).not.toContain('fedcba98')
+  expect(Object.keys(out.runs[0] ?? {}).sort()).toEqual(['at', 'auth', 'cached', 'durationS', 'exitCode', 'fellBack', 'input', 'label', 'output', 'skip'])
+})
+
+test('parseCodex edge cases: guard quote, CRLF, quoted label, short and garbled rows, control characters, huge numbers', () => {
+  const guard = csvRow({ label: "'=SUM(A1)" }) // codex-review.sh puts a ' in front of = + @ -
+  const quoted = csvRow({ label: 'acme/web-api#14, "big" fix' })
+  const short = `${at(1)},${FAKE_EMAIL},acme/web-api#15`
+  const garbled = csvRow({ timestamp: 'yesterday' })
+  const badAuth = csvRow({ auth: 'wat' })
+  const control = csvRow({ label: 'acme/\u001b[31mred\u202e#16\nnext' })
+  const huge = csvRow({ label: 'acme/web-api#17', input_tokens: '9'.repeat(40), output_tokens: '-5', duration_s: 'abc', cached_input_tokens: '1e9' })
+  const text = csvOf(guard, quoted, short, garbled, badAuth, control, huge).replace(/\n/g, '\r\n')
+  const out = parseCodex(text, 0)
+
+  expect(out.runs.map(r => r.label)).toEqual(['=SUM(A1)', 'acme/web-api#14, "big" fix', 'acme/ [31mred #16  next', 'acme/web-api#17'])
+  expect(out.runs[3]).toMatchObject({ input: 0, output: 0, durationS: 0, cached: 0 })
+  expect(JSON.stringify(out)).not.toMatch(/[\u0000-\u001f\u202e]/)
+  expect(parseCodex('', 0).runs).toEqual([])
+  expect(parseCodex('no header here\n1,2,3\n', 0).runs).toEqual([])
+  expect(parseCodex(`timestamp,auth\n${at(1)},plan\n`, 0).runs).toEqual([]) // no label column: not our file
+})
+
+test('parseCodex cuts a long label to 40 and keeps only the log\'s last 500 lines', () => {
+  const long = parseCodex(csvOf(csvRow({ label: `acme/${'x'.repeat(100)}#1` })), 0).runs[0]?.label ?? ''
+  expect(long.length).toBe(40)
+  expect(long.endsWith('…')).toBe(true)
+
+  const many = Array.from({ length: 600 }, (_, i) => csvRow({ label: `acme/web-api#${i}` }))
+  const out = parseCodex(csvOf(...many), 0)
+  expect(out.totals.runs).toBe(500)
+  expect(out.runs[out.runs.length - 1]?.label).toBe('acme/web-api#599')
+  expect(out.runs).toHaveLength(8)
+})
+
+test('parseCodex hides rows before the session start and counts skipped rows apart', () => {
+  const before = csvRow({ timestamp: at(-120), label: 'acme/web-api#1' })
+  const mine = csvRow({ timestamp: at(0), label: 'acme/web-api#2' })
+  const skipped = csvRow({ timestamp: at(1), label: 'acme/web-api#3', auth: 'none', exit_code: '0', input_tokens: '', cached_input_tokens: '', output_tokens: '', duration_s: '', skip_reason: 'no_code' })
+  const out = parseCodex(csvOf(before, mine, skipped), T0 - MIN)
+
+  expect(out.runs.map(r => r.label)).toEqual(['acme/web-api#2', 'acme/web-api#3'])
+  expect(out.totals.runs).toBe(1) // the skipped row is shown, not counted as a run
+  expect(out.runs[1]).toMatchObject({ skip: 'no_code', auth: 'none' })
+  // the plan-run times, for the estimate, are kept whatever the session start
+  expect(out.planDoneAt).toEqual([T0 - 120 * MIN, T0])
+})
+
+test('saneCodex repairs a stored value: bad rows dropped, numbers finite, labels cleaned again', () => {
+  const out = saneCodex({ runs: [{ label: 'a\nb', at: Number.NaN, input: -4, auth: 'x', skip: 5 }, { nolabel: true }, 7], totals: { runs: 'many' }, planDoneAt: [1, 'x', Number.NaN, -3] })
+
+  expect(out.runs).toEqual([{ label: 'a b', at: 0, durationS: 0, input: 0, cached: 0, output: 0, auth: 'none', fellBack: false, exitCode: null, skip: '' }])
+  expect(out.totals.runs).toBe(0)
+  expect(out.planDoneAt).toEqual([1])
+  expect(saneCodex(undefined).runs).toEqual([])
+})
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`the Codex section on ${surface}: big number, a row per run, totals, plan link; hidden with no session rows`, async ($, on) => {
+    const { w } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(-300) })) }) // only an old row
+    await startSession($)
+    const empty = await $.ui.mount({ ...PANE, surface })
+    expect(await empty.find({ type: 'Text', text: 'Codex' })).toBeUndefined()
+    await empty.unmount()
+
+    w.csv = csvOf(csvRow({ timestamp: at(-300) }), csvRow({ timestamp: at(2) }), csvRow({ timestamp: at(3), label: 'acme/web-api#13', auth: 'api', fell_back: 'yes', input_tokens: '1000', cached_input_tokens: '0', output_tokens: '500', duration_s: '40' }))
+    w.mtime = 2
+    await runMeter($, '')
+    const ui = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 120 } })
+    const text = await allText(ui)
+
+    expect(await ui.find({ type: 'Text', text: 'Codex' })).toBeDefined()
+    expect(text).toContain('≈$0.16') // the first run's API-equivalent price, in the big number and its row
+    expect(text).toContain('API-equivalent · 2 runs · 4 min')
+    expect(text).toContain('acme/web-api#12 · 3m26s · 429k in (382k cached) · 2.8k out · plan')
+    expect(text).toContain('acme/web-api#13 · 40s · 1.0k in (0 cached) · 500 out · api · ↪ fell back')
+    expect(text).toContain('total 430k in · 382k cached · 3.3k out')
+    expect(await ui.find({ type: 'Link', text: 'chatgpt.com/settings/usage' })).toBeDefined()
+    expect((await ui.find({ type: 'Link', text: /settings\/usage/ }))?.props.href).toBe('https://chatgpt.com/settings/usage')
+    expect(await ui.find({ type: 'Svg', text: /Codex/ })).toBeUndefined()
+    await ui.unmount()
+  })
+}
+
+test('the section sits between GitHub and Dollars, and a missing file leaves it out with no error', async ($, on) => {
+  const { w } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  await startSession($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const order = (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => ['GitHub', 'Codex', 'Guard · nothing blocked yet'].includes(t) || /^Dollars/.test(t))
+  expect(order.slice(0, 3)).toEqual(['GitHub', 'Codex', order[2]])
+  expect(order[2]).toMatch(/^Dollars/)
+  await ui.unmount()
+
+  w.csv = undefined // the file went away
+  await runMeter($, '')
+  const gone = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await gone.find({ type: 'Text', text: 'Codex' })).toBeUndefined()
+  await gone.unmount()
+})
+
+test('at the docked width a long run row moves its token counts to muted lines, and nothing is wider than the pane', async ($, on) => {
+  codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2), label: `acme/${'long-name-'.repeat(6)}#9`, fell_back: 'yes', auth: 'api' }), csvRow({ timestamp: at(3), label: 'acme/web-api#12' })) })
+  await startSession($)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface }) // bodyColumns 44 -> 42 cells
+    const texts = await ui.findAll({ type: 'Text' })
+    const lines = texts.map(t => t.text)
+    const heads = lines.filter(t => t.includes(' · 3m26s'))
+    expect(heads).toHaveLength(2)
+    expect(heads[0]?.length).toBeLessThanOrEqual(42 - '≈$0.16'.length) // the api row's cost is plain
+    expect(heads[1]?.length).toBeLessThanOrEqual(42 - '≈$0.16 API-eq'.length)
+    expect(heads[1]).toBe('acme/web-api#12 · 3m26s') // a short label is not cut
+    expect(lines.filter(t => t === '≈$0.16 API-eq')).toHaveLength(1) // the plan row: nothing was billed
+    expect(lines.filter(t => t === '≈$0.16')).toHaveLength(1) // the api row: plain
+    const detail = texts.find(t => t.text.startsWith('429k in'))
+    expect(detail?.props.dimColor).toBe(true)
+    expect(lines).toContain('api · ↪ fell back') // the long row's second muted line (the script only falls back to the API)
+    expect(lines).toContain('plan · 429k in (382k cached) · 2.8k out') // the short row's one
+    for (const t of lines.filter(x => x.includes(' in (') || x.includes('Plan') || x.includes('plan ·'))) expect(t.length).toBeLessThanOrEqual(42)
+    await ui.unmount()
+  }
+})
+
+test('codexRow: one line when it fits, split in two when it does not, a muted reason for a skipped or failed run', () => {
+  const run = { label: 'acme/web-api#12', at: T0, durationS: 206, input: 241_000, cached: 199_000, output: 6_100, auth: 'plan' as const, fellBack: false, exitCode: 0, skip: '' }
+  const wide = codexRow(run, 100)
+  expect(wide).toMatchObject({ head: 'acme/web-api#12 · 3m26s · 241k in (199k cached) · 6.1k out · plan', details: [], muted: false })
+  expect(wide.cost).toBe('≈$0.16 if API') // a plan run: nothing was billed
+  expect(codexRow({ ...run, auth: 'api' }, 100).cost).toBe('≈$0.16') // an API run: plain
+  const narrow = codexRow(run, 40)
+  expect(narrow.head).toBe('acme/web-api#12 · 3m26s')
+  expect(narrow.details).toEqual(['plan · 241k in (199k cached) · 6.1k out'])
+  expect(narrow.cost).toBe('≈$0.16 API-eq')
+  expect(codexRow({ ...run, fellBack: true }, 40).details).toEqual(['241k in (199k cached) · 6.1k out', 'plan · ↪ fell back'])
+  expect(codexRow({ ...run, input: 0, cached: 0, output: 0, skip: 'no_code', auth: 'none' }, 60)).toMatchObject({ head: 'acme/web-api#12 · skip: no_code', cost: '', muted: true })
+  expect(codexRow({ ...run, skip: 'no_code' }, 60).cost).toBe('') // even with token counts on the row, a skipped run shows no ≈$
+  expect(codexRow({ ...run, exitCode: 4, input: 0, cached: 0, output: 0 }, 60)).toMatchObject({ head: 'acme/web-api#12 · exit 4', muted: true })
+  expect(codexDuration(54)).toBe('54s')
+  expect(codexDuration(206)).toBe('3m26s')
+  expect(codexDuration(3720)).toBe('1h02m')
+})
+
+test('the section keeps the 8 latest runs and the totals count every one', async ($, on) => {
+  codexSetup(on, { csv: csvOf(...Array.from({ length: 11 }, (_, i) => csvRow({ timestamp: at(i + 1), label: `acme/web-api#${i + 1}`, input_tokens: '1000000', cached_input_tokens: '0', output_tokens: '0' }))) })
+  await startSession($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  const text = await allText(ui)
+
+  expect(text).toContain('API-equivalent · 11 runs')
+  expect(text).toContain('≈$22.00') // 11 x 1M uncached input at $2
+  expect(text).not.toContain('acme/web-api#3 ')
+  expect(text).toContain('acme/web-api#4 ')
+  expect(text).toContain('acme/web-api#11 ')
+  await ui.unmount()
+})
+
+test('the mod reads ONE path and nothing else: stat and read see only ~/.amiqa/codex-review-runs.csv, never ~/.codex, no other fs call', async ($, on) => {
+  const { w, clock } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  const spawned: string[] = []
+  on('process.run', (_, e) => {
+    spawned.push(e.argv.join(' '))
+
+    return gh('[]')
+  })
+  await startSession($)
+  await runMeter($, '')
+  await runMeter($, 'codex 97 6d2h')
+  await runMeter($, 'codex')
+  await $.tool.call({ tool: 'Bash', command: 'bash .claude/bin/codex-review.sh 12' })
+  w.mtime = 9
+  await clock.advance(70_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.unmount()
+
+  expect(w.stats.length).toBeGreaterThan(2)
+  expect(w.reads.length).toBeGreaterThan(0)
+  expect(new Set([...w.stats, ...w.reads])).toEqual(new Set([CODEX_PATH]))
+  expect(w.others).toEqual([])
+  expect(spawned.filter(a => /codex/.test(a))).toEqual([])
+})
+
+test('an unchanged file is not read again, a changed one is: the stat decides', async ($, on) => {
+  const { w, clock } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  await startSession($)
+  expect(w.reads).toHaveLength(1)
+
+  await clock.advance(130_000) // two minutes of ticks: stat every minute, no read
+  expect(w.stats.length).toBeGreaterThan(1)
+  expect(w.reads).toHaveLength(1)
+  await runMeter($, '')
+  expect(w.reads).toHaveLength(1)
+
+  w.csv = csvOf(csvRow({ timestamp: at(2) }), csvRow({ timestamp: at(4), label: 'acme/web-api#20' }))
+  w.mtime = 2
+  await clock.advance(70_000)
+  expect(w.reads).toHaveLength(2)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  expect(await allText(ui)).toContain('acme/web-api#20')
+  await ui.unmount()
+})
+
+test('a Bash call that ran codex-review re-reads the log at once; any other Bash call does not', async ($, on) => {
+  const { w } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(-300) })) })
+  await startSession($)
+  w.csv = csvOf(csvRow({ timestamp: at(-300) }), csvRow({ timestamp: at(5), label: 'acme/web-api#30' }))
+  w.mtime = 5
+  const readsBefore = w.reads.length
+
+  await $.tool.call({ tool: 'Bash', command: 'ls -la' })
+  expect(w.reads).toHaveLength(readsBefore)
+  await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'a1' })
+  expect(w.reads).toHaveLength(readsBefore)
+  await $.tool.call({ tool: 'Bash', command: '.claude/bin/codex-review.sh 30', agentId: 'a1' }) // a subagent counts too
+  expect(w.reads).toHaveLength(readsBefore + 1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  expect(await allText(ui)).toContain('acme/web-api#30')
+  await ui.unmount()
+})
+
+test('no email and no local path from the CSV reaches the pane, the one-line summary or a /meter codex answer', async ($, on) => {
+  codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) }), csvRow({ timestamp: at(3), label: 'acme/web-api#13', auth: 'none', skip_reason: 'no_code' })) })
+  await startSession($)
+  const shown: string[] = []
+  const said = [await runMeter($, ''), await runMeter($, 'codex 97 6d2h'), await runMeter($, 'codex'), await runMeter($, 'codex nonsense')]
+  for (const r of said) shown.push(r.text ?? '')
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    shown.push(JSON.stringify(await ui.findAll({ type: 'Text' })), JSON.stringify(await ui.findAll({ type: 'Box' })), JSON.stringify(await ui.findAll({ type: 'Link' })))
+    await ui.unmount()
+  }
+  const all = shown.join('\n')
+
+  expect(all).toContain('acme/web-api#12') // it did draw the run
+  expect(all).not.toContain('@')
+  expect(all).not.toContain('/Users/')
+  expect(all).not.toContain('example.com')
+  expect(all).not.toContain('0123456789abcdef')
+})
+
+test('/meter adds "Codex N runs ≈$X" only when this session ran Codex; the line stays one line', async ($, on) => {
+  const { w } = codexSetup(on, {})
+  await startSession($)
+  expect((await runMeter($, '')).text).not.toContain('Codex')
+
+  w.csv = csvOf(csvRow({ timestamp: at(2) }))
+  w.mtime = 3
+  const one = (await runMeter($, '')).text ?? ''
+  expect(one).toContain(' · Codex 1 run ≈$0.16 API-eq')
+  expect(one.includes('\n')).toBe(false)
+
+  w.csv = csvOf(csvRow({ timestamp: at(2) }), csvRow({ timestamp: at(3) }))
+  w.mtime = 4
+  expect((await runMeter($, '')).text).toContain(' · Codex 2 runs ≈$0.32 API-eq')
+})
+
+test('parseDuration and parsePercent: the shapes /meter codex takes, nothing else', () => {
+  const m = 60_000
+  expect(parseDuration('6d2h', 7 * 24 * 60 * m)).toBe((6 * 24 * 60 + 2 * 60) * m)
+  expect(parseDuration('2h10m', 7 * 24 * 60 * m)).toBe(130 * m)
+  expect(parseDuration('45m', 7 * 24 * 60 * m)).toBe(45 * m)
+  expect(parseDuration('1d', 7 * 24 * 60 * m)).toBe(24 * 60 * m)
+  for (const bad of ['', '0m', '0d0h', '6', 'd', '2h6d', '10m2h', '1.5h', '-3h', '6 d', '6dd', '8d', 'abc', '2h10', '99999h']) expect(parseDuration(bad, 7 * 24 * 60 * m)).toBeUndefined()
+  expect(parseDuration('6h', 5 * 60 * m)).toBeUndefined() // the 5-hour window cannot reset in 6 hours
+  expect(parsePercent('0')).toBe(0)
+  expect(parsePercent('97')).toBe(97)
+  expect(parsePercent('97.5')).toBe(97.5)
+  expect(parsePercent('100')).toBe(100)
+  for (const bad of ['', '101', '-1', '97%', '97.55', '1e2', ' 5', 'x', '100.5', '1000']) expect(parsePercent(bad)).toBeUndefined()
+})
+
+test('parseCodexArgs: show, <pct> <reset>, the optional 5h pair, and a rejection for everything else', () => {
+  const m = 60_000
+  expect(parseCodexArgs('')).toBe('show')
+  expect(parseCodexArgs('   ')).toBe('show')
+  expect(parseCodexArgs('97 6d2h')).toEqual({ weekPct: 97, weekMs: (6 * 24 * 60 + 120) * m, fiveHPct: null, fiveHMs: null })
+  expect(parseCodexArgs('97 6d2h 5h=80 5hreset=2h10m')).toEqual({ weekPct: 97, weekMs: (6 * 24 * 60 + 120) * m, fiveHPct: 80, fiveHMs: 130 * m })
+  expect(parseCodexArgs('50 1d 5hreset=45m 5h=0')).toMatchObject({ fiveHPct: 0, fiveHMs: 45 * m })
+  for (const bad of ['97', '97 soon', '101 6d', '97 6d2h 5h=80', '97 6d2h 5hreset=2h', '97 6d2h 5h=80 5hreset=9h', '97 6d2h 5h=80 5h=70', '97 6d2h 5h=80 foo=1', '97 6d2h x y', '97 6d2h 5h=80 5hreset=2h 1', 'a b', '97 6d2h 5h=abc 5hreset=2h']) {
+    expect(parseCodexArgs(bad)).toBeUndefined()
+  }
+})
+
+test('/meter codex stores the limit and answers in one line; /meter codex alone shows it; bad input is rejected and stores nothing', async ($, on) => {
+  const { store } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  await startSession($)
+  const now = T0 + 10 * MIN
+
+  const empty = (await runMeter($, 'codex')).text ?? ''
+  expect(empty).toContain('not set')
+
+  const saved = (await runMeter($, 'codex 97 6d2h 5h=80 5hreset=2h10m')).text ?? ''
+  expect(saved.includes('\n')).toBe(false)
+  expect(saved).toContain('97% week left')
+  expect(saved).toContain(`resets ${resetText(now + (6 * 24 + 2) * 60 * MIN)}`)
+  expect(saved).toContain(`5h: 80% left, resets ${resetText(now + 130 * MIN, true)}`)
+  expect(saved).toContain('entered just now')
+  expect(store.get('codex-limits-1')).toEqual({ weekPct: 97, weekResetAt: now + (6 * 24 + 2) * 60 * MIN, fiveHPct: 80, fiveHResetAt: now + 130 * MIN, enteredAt: now })
+
+  const shown = (await runMeter($, 'codex')).text ?? ''
+  expect(shown).toContain('97% week left')
+  expect(shown.includes('\n')).toBe(false)
+
+  const before = store.get('codex-limits-1')
+  for (const bad of ['codex 150 6d', 'codex 97', 'codex 97 whenever', 'codex 97 6d2h 5h=80']) {
+    const out = (await runMeter($, bad)).text ?? ''
+    expect(out).toMatch(/^Usage: \/meter codex <pct> <reset>/)
+    expect(out.includes('\n')).toBe(false)
+  }
+  expect(store.get('codex-limits-1')).toEqual(before)
+  expect((await runMeter($, 'codexx 97 6d')).text).toContain('Session $') // another word is not the codex command
+})
+
+test('the plan line, the estimate and the usage link are in the pane; the estimate counts plan reviews since the entry', async ($, on) => {
+  // entered at the clock time (T0 + 10 min); two plan runs finish after it, one before
+  const entered = T0 + 10 * MIN
+  const limits = { weekPct: 97, weekResetAt: entered + 6 * 24 * 60 * MIN, fiveHPct: null, fiveHResetAt: null, enteredAt: entered }
+  const { clock } = codexSetup(
+    on,
+    { csv: csvOf(csvRow({ timestamp: at(5) }), csvRow({ timestamp: at(12) }), csvRow({ timestamp: at(15) }), csvRow({ timestamp: at(16), auth: 'api' }), csvRow({ timestamp: at(17), exit_code: '3' })) },
+    { 'codex-limits-1': limits },
+  )
+  await startSession($)
+  await clock.advance(30 * MIN)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 120 } })
+    const text = await allText(ui)
+    expect(text).toContain(`Plan: 97% week left · resets ${resetText(limits.weekResetAt)} · entered 30m ago`)
+    expect(text).toContain('≈ 95.8% now (2 plan reviews since × ~0.6%)') // api and failed rows do not count
+    expect(await ui.find({ type: 'Link', text: 'chatgpt.com/settings/usage' })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('without a typed limit the pane says how to enter one; once the week has reset the old number is not trusted', async ($, on) => {
+  const { clock } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  await startSession($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  expect(await allText(ui)).toContain('Plan limit: /meter codex <pct> <reset>')
+  await ui.unmount()
+
+  await runMeter($, 'codex 90 1h')
+  await clock.advance(2 * 60 * MIN)
+  const late = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  const text = await allText(late)
+  expect(text).toContain('week has reset, enter a new value')
+  expect(text).not.toContain('plan review')
+  expect(text).not.toContain('90%')
+  const reply = (await runMeter($, 'codex')).text ?? ''
+  expect(reply).toContain('week has reset, enter a new value')
+  expect(reply).not.toContain('90%')
+  await late.unmount()
+})
+
+test('codexEstimate, saneLimits, resetText and agoText', () => {
+  const limits = { weekPct: 50, weekResetAt: 1000, fiveHPct: null, fiveHResetAt: null, enteredAt: 100 }
+  const codex = { runs: [], totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [50, 100, 101, 200, 300], tooBig: false }
+  expect(codexEstimate(limits, codex, 500)).toEqual({ pct: 50 - 3 * 0.6, reviews: 3 }) // strictly after the entry
+  expect(codexEstimate(limits, codex, 1000)).toBeUndefined()
+  expect(codexEstimate({ ...limits, weekPct: 1 }, codex, 500)?.pct).toBe(0) // never below 0
+
+  expect(saneLimits({ weekPct: 97, weekResetAt: 5, enteredAt: 1, fiveHPct: 80 })).toEqual({ weekPct: 97, weekResetAt: 5, enteredAt: 1, fiveHPct: null, fiveHResetAt: null })
+  expect(saneLimits({ weekPct: 197, weekResetAt: 5, enteredAt: 1 })).toBeUndefined()
+  expect(saneLimits('x')).toBeUndefined()
+  expect(resetText(Date.parse('2026-11-15T12:20:00'))).toBe('Sun 15/11 12:20') // local time, as the machine reads it
+  expect(resetText(Date.parse('2026-11-15T12:20:00'), true)).toBe('12:20')
+  expect(agoText(30_000)).toBe('just now')
+  expect(agoText(3 * 60 * MIN)).toBe('3h ago')
+  expect(agoText(5 * MIN)).toBe('5m ago')
+  expect(agoText(72 * 60 * MIN)).toBe('3d ago')
+})
+
+// -- fix round: corrupt stored limits, the 4 MiB cap, invisible characters, surrogates, stricter durations ------
+test('saneLimits drops a value whose times make no sense; the corrupt one from the review draws no NaN', async ($, on) => {
+  const corrupt = { weekPct: 97, weekResetAt: 1e300, fiveHPct: null, fiveHResetAt: null, enteredAt: -1e300 }
+  expect(saneLimits(corrupt)).toBeUndefined()
+  const day = 24 * 60 * MIN
+  const ok = { weekPct: 50, weekResetAt: 1000 + 6 * day, enteredAt: 1000, fiveHPct: 40, fiveHResetAt: 1000 + 60 * MIN }
+  expect(saneLimits(ok)).toEqual(ok)
+  expect(saneLimits({ ...ok, enteredAt: 0 })).toBeUndefined() // entered after 0
+  expect(saneLimits({ ...ok, enteredAt: -5 })).toBeUndefined()
+  expect(saneLimits({ ...ok, weekResetAt: 999 })).toBeUndefined() // resets before it was entered
+  expect(saneLimits({ ...ok, weekResetAt: 1000 + 7 * day + 1 })).toBeUndefined()
+  expect(saneLimits({ ...ok, weekResetAt: 1000 + 7 * day })?.weekPct).toBe(50)
+  // the 5-hour part is dropped alone when it is out of its window; the week stays
+  expect(saneLimits({ ...ok, fiveHResetAt: 1000 + 5 * 60 * MIN + 1 })).toMatchObject({ weekPct: 50, fiveHPct: null, fiveHResetAt: null })
+  expect(saneLimits({ ...ok, fiveHResetAt: 999 })).toMatchObject({ fiveHPct: null, fiveHResetAt: null })
+  expect(saneLimits({ ...ok, fiveHPct: 101 })).toMatchObject({ fiveHPct: null, fiveHResetAt: null })
+
+  codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) }, { 'codex-limits-1': corrupt })
+  await startSession($)
+  expect((await runMeter($, 'codex')).text).toContain('not set') // the bad value is as good as none
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  const text = await allText(ui)
+  expect(text).not.toMatch(/NaN|e\+|Infinity/)
+  expect(text).toContain('Plan limit: /meter codex <pct> <reset>')
+  await ui.unmount()
+})
+
+test('a log over 4 MiB is not read: the last good rows stay with one muted line, and nothing is re-read until it changes', async ($, on) => {
+  const { w, clock } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  await startSession($)
+  expect(w.reads).toHaveLength(1)
+
+  w.size = 4 * 1024 * 1024 + 1
+  w.mtime = 2
+  await runMeter($, '')
+  await clock.advance(200_000)
+  await runMeter($, '')
+  expect(w.reads).toHaveLength(1) // not asked for, then not asked again
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 120 } })
+    const lines = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    expect(lines).toContain('Codex log over 4 MB, rotate ~/.amiqa/codex-review-runs.csv')
+    expect((await ui.find({ type: 'Text', text: /^Codex log over/ }))?.props.dimColor).toBe(true)
+    expect(lines.join('\n')).toContain('acme/web-api#12') // the last good read is still drawn
+    await ui.unmount()
+  }
+
+  w.size = undefined // rotated: small again
+  w.mtime = 3
+  w.csv = csvOf(csvRow({ timestamp: at(4), label: 'acme/web-api#40' }))
+  await runMeter($, '')
+  expect(w.reads).toHaveLength(2)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  const text = await allText(ui)
+  expect(text).not.toContain('over 4 MB')
+  expect(text).toContain('acme/web-api#40')
+  await ui.unmount()
+})
+
+test('a log that is over 4 MiB from the start shows only the muted line, and a read that fails is not retried until the file changes', async ($, on) => {
+  const { w, clock } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })), size: 5 * 1024 * 1024 })
+  await startSession($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const text = await allText(ui)
+  expect(text).toContain('Codex log over 4 MB')
+  expect(text).not.toContain('acme/web-api#12')
+  expect(w.reads).toHaveLength(0)
+  await ui.unmount()
+
+  // a read the engine refuses for another reason: tried once per file state
+  w.size = undefined
+  w.mtime = 7
+  w.failRead = true
+  await clock.advance(70_000)
+  await clock.advance(70_000)
+  await runMeter($, '')
+  expect(w.reads).toHaveLength(1)
+})
+
+test('a refresh asked for while one is running is not lost: one more follows', async ($, on) => {
+  const { w } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  let release: () => void = () => undefined
+  w.gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const starting = startSession($)
+  while (w.stats.length === 0) await new Promise(resolve => setTimeout(resolve, 1))
+
+  w.csv = csvOf(csvRow({ timestamp: at(2) }), csvRow({ timestamp: at(3), label: 'acme/web-api#50' }))
+  w.mtime = 2
+  w.gate = undefined
+  await runMeter($, '') // asked for while the first stat is still waiting
+  release()
+  await starting
+  while (w.stats.length < 2) await new Promise(resolve => setTimeout(resolve, 1))
+  while (w.reads.length < 2) await new Promise(resolve => setTimeout(resolve, 1))
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  expect(await allText(ui)).toContain('acme/web-api#50')
+  await ui.unmount()
+})
+
+test('clean strips zero-width and bidi marks, line and paragraph separators and the BOM; a label with them is cleaned at parse time', () => {
+  expect(clean('a\u200fb\u200bc\u061cd')).toBe('a b c d')
+  expect(clean('a\u2028b\u2029c\ufeffd\u200ee')).toBe('a b c d e')
+  const out = parseCodex(csvOf(csvRow({ label: 'acme/a\u200fb\u200bc\u061cd\u2028e\ufeff#1' })), 0)
+  expect(out.runs[0]?.label).toBe('acme/a b c d e #1')
+})
+
+test('truncate never leaves half an emoji', () => {
+  const cut = truncate(`${'a'.repeat(38)}😀b`, 40)
+  expect(cut).toBe(`${'a'.repeat(38)}…`)
+  expect(/[\ud800-\udbff]$/.test(cut.slice(0, -1))).toBe(false)
+  expect(truncate(`${'a'.repeat(37)}😀bb`, 40)).toBe(`${'a'.repeat(37)}😀…`) // a whole one still fits
+  expect(truncate('😀😀😀', 3)).toBe('😀…')
+  expect(truncate('😀😀😀', 2)).toBe('…')
+  expect(truncate('abcdef', 4)).toBe('abc…')
+})
+
+test('parseCodex: with a duplicated header name the first column wins; a timestamp without the Z is rejected', () => {
+  const cols = [...CODEX_HEADER.split(','), 'label']
+  const dup = `${cols.join(',')}\n${csvRow({ label: 'acme/first#1' }, CODEX_HEADER.split(',')).concat(',acme/second#2')}\n`
+  expect(parseCodex(dup, 0).runs.map(r => r.label)).toEqual(['acme/first#1'])
+
+  const noZ = csvRow({ timestamp: '2026-11-09T09:00:00' })
+  const offset = csvRow({ timestamp: '2026-11-09T09:00:00+01:00' })
+  const dateOnly = csvRow({ timestamp: '2026-11-09' })
+  expect(parseCodex(csvOf(noZ, offset, dateOnly), 0).runs).toEqual([])
+  expect(parseCodex(csvOf(csvRow({ timestamp: '2026-11-09T09:00:00Z' })), 0).runs).toHaveLength(1)
+})
+
+test('parseDuration rejects minutes of 60 or more, and hours of 24 or more next to days', () => {
+  const week = 7 * 24 * 60 * MIN
+  for (const bad of ['1h60m', '60m', '99m', '1d24h', '1d30h', '2d25h10m']) expect(parseDuration(bad, week)).toBeUndefined()
+  expect(parseDuration('59m', week)).toBe(59 * MIN)
+  expect(parseDuration('30h', week)).toBe(30 * 60 * MIN) // hours alone may pass a day
+  expect(parseDuration('1d23h59m', week)).toBe((24 * 60 + 23 * 60 + 59) * MIN)
+  expect(parseCodexArgs('97 1h60m')).toBeUndefined()
+  expect(parseCodexArgs('97 6d2h 5h=80 5hreset=1h60m')).toBeUndefined()
+})
+
+test('a label ending in a line break does not swallow the rows after it: the last 500 records are kept, not the last 500 lines', () => {
+  const rows = [csvRow({ label: 'acme#x\n' }), ...Array.from({ length: 499 }, (_, i) => csvRow({ label: `acme/web-api#${i}` }))]
+  const out = parseCodex(csvOf(...rows), 0)
+  expect(out.totals.runs).toBe(500)
+  expect(out.runs[out.runs.length - 1]?.label).toBe('acme/web-api#498')
+  const more = parseCodex(csvOf(csvRow({ label: 'acme#old' }), ...rows), 0) // 501 records: the oldest goes
+  expect(more.totals.runs).toBe(500)
+})
+
+test('the 5-hour part is not shown either once its window has reset', async ($, on) => {
+  const { clock } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  await startSession($)
+  await runMeter($, 'codex 90 6d 5h=33 5hreset=1h')
+  await clock.advance(2 * 60 * MIN)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  const text = await allText(ui)
+  expect(text).toContain('5h: has reset, enter a new value')
+  expect(text).toContain('Plan: 90% week left')
+  expect(text).not.toContain('33%')
+  const reply = (await runMeter($, 'codex')).text ?? ''
+  expect(reply).toContain('5h has reset')
+  expect(reply).not.toContain('33%')
+  await ui.unmount()
+})
+
+test('clean keeps a zero-width joiner, so a joined emoji is not split', () => {
+  expect(clean('👨‍👩‍👧')).toBe('👨‍👩‍👧')
+  expect(clean('a\u200db')).toBe('a\u200db')
+  expect(clean('a\u200cb\u200eb')).toBe('a b b')
 })
