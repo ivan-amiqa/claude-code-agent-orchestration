@@ -50,10 +50,11 @@ const ciAtom = atom({ plugin: 'meter', key: 'ci' } as const, EMPTY_CI, { shape: 
 
 // The Codex runs THIS session launched, read from the one local log `codex-review.sh`
 // writes (see the Codex block below), plus the launches themselves. Its own atom and tag, so a bump of `data`
-// or `ci` never wipes it. Bump `codex-2` only when MeterCodex itself changes (codex-1 held every row on the
-// machine and no launches: it is declined, and `saneCodex` empties one that gets through).
-const EMPTY_CODEX: MeterCodex = { runs: [], totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [], launches: [], tooBig: false }
-const codexAtom = atom({ plugin: 'meter', key: 'codex' } as const, EMPTY_CODEX, { shape: 'codex-2' })
+// or `ci` never wipes it. Bump `codex-3` only when MeterCodex itself changes (codex-1 held every row on the
+// machine and no launches; codex-2 also held the latest rows and launches keyed by a 40-character label: both are
+// declined by the tag, and `saneCodex` empties or repairs one that gets through).
+const EMPTY_CODEX: MeterCodex = { totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [], launches: [], tooBig: false }
+const codexAtom = atom({ plugin: 'meter', key: 'codex' } as const, EMPTY_CODEX, { shape: 'codex-3' })
 
 const MAX_GROUPS = 12 // columns of the Dollars chart, step 1 alone included
 const MAX_AGENTS = 60
@@ -110,6 +111,8 @@ type Dollar = EngineInterface
 
 // -- formatting -------------------------------------------------------------
 const usd = (n: number) => `$${n.toFixed(2)}`
+/** The sum of two prices as they are DRAWN (each rounded to cents first), so `$12.39 (Claude $10.65 + Codex ≈$1.74)` always adds up. */
+export const addUsd = (a: number, b: number): number => Number((Number(a.toFixed(2)) + Number(b.toFixed(2))).toFixed(2))
 /** Dollars in as few characters as keep the number whole: `$1.2k`, `$12k`, `$1.2M`; under 1000 as `usd`. */
 export const usdShort = (n: number): string =>
   n >= 1_000_000 ? `$${n >= 10_000_000 ? Math.round(n / 1_000_000) : (n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `$${n >= 10_000 ? Math.round(n / 1000) : (n / 1000).toFixed(1)}k` : usd(n)
@@ -206,7 +209,7 @@ export function summary(d: MeterData, ci: MeterPr[], codex: MeterCodex = EMPTY_C
   const prs = ci.length > 0 ? ` · CI: ${ci.length} PR${ci.length === 1 ? '' : 's'}, ${ciWorst(ci)}` : ''
 
   // The session total is Claude + Codex; Codex is an API-equivalent price (nothing was billed on a plan run).
-  const session = codex.totals.runs > 0 ? `${usd(d.costUsd + codex.totals.usd)} (Claude ${usd(d.costUsd)} + Codex ≈${usd(codex.totals.usd)} API-eq)` : usd(d.costUsd)
+  const session = codex.totals.runs > 0 ? `${usd(addUsd(d.costUsd, codex.totals.usd))} (Claude ${usd(d.costUsd)} + Codex ≈${usd(codex.totals.usd)} API-eq)` : usd(d.costUsd)
 
   return `Session ${session} · context ${tokens(d.contextTokens)} · ${cache}${agents}${prs}`
 }
@@ -532,7 +535,7 @@ export const CODEX_USAGE_URL = 'https://chatgpt.com/settings/usage'
 const MAX_CODEX_RUNS = 8 // rows drawn; the totals count every row read
 const MAX_CODEX_LINES = 500 // the log's last lines looked at
 const MAX_CODEX_PLAN = 500
-const MAX_LAUNCHES = 100
+const MAX_LAUNCHES = MAX_CODEX_LINES // as many as the log's records looked at, so a launch is never dropped while its row is still in view
 const CLAIM_WINDOW_MS = 2 * 60 * 60 * 1000 // a launch claims rows for this long, if no later launch of the same label takes over
 const MAX_COMMAND_CHARS = 20_000 // a Bash command is read no further than this for a launch
 const CODEX_AUTH = ['plan', 'api', 'none'] as const
@@ -570,16 +573,32 @@ export function parseCsv(text: string): string[][] {
 
 /** `codex-review.sh` puts a `'` in front of a field that starts with `= + @ - TAB`; take it off again. */
 const unguard = (v: string): string => (v.length > 1 && v.startsWith("'") && '=+@-\t'.includes(v.charAt(1)) ? v.slice(1) : v)
-/**
- * A label as it is stored, drawn and matched: an e-mail address becomes `…`, a path (`/Users/x/repo`, `~/repo`)
- * keeps only its last part, control characters go, 40 characters at most. Launch labels and log labels go through
- * this alike, so they still match.
- */
-export const codexLabel = (raw: string): string => {
-  const noMail = raw.replace(/\S+@\S+/g, '…').trim()
-  const last = /^[/~]/.test(noMail) ? (noMail.split('/').filter(x => x !== '').pop() ?? '') : noMail
+const MAX_LABEL_KEY = 200
+/** A label holding an e-mail address, or starting like a path (`/Users/x/repo`, `~/repo`): nothing of it is stored or drawn. */
+const sensitiveLabel = (cleaned: string): boolean => /\S+@\S+/.test(cleaned) || /^[/~]/.test(cleaned)
+/** FNV-1a, 32 bits, from a given offset basis: two of them make a 64-bit match key (not a security hash; no readable text is kept). */
+const fnv1a = (text: string, basis: number): string => {
+  let h = basis >>> 0
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193) >>> 0
 
-  return agentName(last)
+  return h.toString(16).padStart(8, '0')
+}
+/**
+ * What a log row's label is matched against, and what a launch stores: the whole label with control characters
+ * cleaned (never cut to 40: two long labels that differ after character 40 stay apart), at most 200 characters.
+ * An e-mail address or a path becomes `h:` and a hash of it. A launch's label and a log's label go through this
+ * alike, so they still match. '' for no label.
+ */
+export const codexLabelKey = (raw: string): string => {
+  const cleaned = clean(raw).trim()
+
+  return sensitiveLabel(cleaned) ? `h:${fnv1a(cleaned, 0x811c9dc5)}${fnv1a(cleaned, 0x2f3a9b17)}` : cleaned.slice(0, MAX_LABEL_KEY)
+}
+/** A label as it is drawn: control characters out, 40 characters at most, `…` for an e-mail address or a path. */
+export const codexLabel = (raw: string): string => {
+  const cleaned = clean(raw).trim()
+
+  return sensitiveLabel(cleaned) ? '…' : agentName(cleaned)
 }
 /** A skip reason as stored: the script writes `reused:<folder>`, so only what is before the first `:` is kept. */
 export const codexSkip = (raw: string): string => truncate(clean(raw.split(':')[0] ?? '').trim(), 24)
@@ -600,14 +619,14 @@ export const codexCost = (input: number, cached: number, output: number): number
  * True when a launch of this `label` made at or before `at` claims the row: the LATEST such launch (so a second
  * launch of the same label takes over from the first), and the row must come within two hours of it.
  */
-export function claimed(launches: CodexLaunch[], label: string, at: number): boolean {
-  return claimOwner(launches, label, at) >= 0
+export function claimed(launches: CodexLaunch[], key: string, at: number): boolean {
+  return claimOwner(launches, key, at) >= 0
 }
 
 /** The time of the launch that claims the row, or -1 when none does. */
-function claimOwner(launches: CodexLaunch[], label: string, at: number): number {
+function claimOwner(launches: CodexLaunch[], key: string, at: number): number {
   let from = -1
-  for (const l of launches) if (l.label === label && l.at <= at && l.at > from) from = l.at
+  for (const l of launches) if (key !== '' && l.key === key && l.at <= at && l.at > from) from = l.at
 
   return from >= 0 && at < from + CLAIM_WINDOW_MS ? from : -1
 }
@@ -619,9 +638,9 @@ function claimOwner(launches: CodexLaunch[], label: string, at: number): number 
  * anything; the last 500 records at most; a row that is short, garbled, before `startedAt` or unclaimed is
  * skipped (the plan-run times, kept for the limit estimate, ignore both: that limit is account-wide).
  */
-export function parseCodex(text: string, startedAt: number, launches?: CodexLaunch[]): MeterCodex {
+export function parseCodex(text: string, startedAt: number, launches?: CodexLaunch[]): MeterCodex & { runs: CodexRun[] } {
   const mine = launches ?? []
-  const empty: MeterCodex = { ...EMPTY_CODEX, launches: mine }
+  const empty = { ...EMPTY_CODEX, runs: [], launches: mine }
   const firstBreak = text.indexOf('\n')
   if (firstBreak < 0) return empty
   const header = parseCsv(text.slice(0, firstBreak).replace(/^\uFEFF/, ''))[0] ?? []
@@ -660,9 +679,10 @@ export function parseCodex(text: string, startedAt: number, launches?: CodexLaun
     if (auth === 'plan' && exitCode === 0 && skip === '' && planDoneAt.length < MAX_CODEX_PLAN) planDoneAt.push(at)
     if (at < startedAt) continue
     const label = codexLabel(get('label')) || 'review'
-    const from = launches === undefined ? -1 : claimOwner(launches, label, at)
+    const key = codexLabelKey(get('label'))
+    const from = launches === undefined ? -1 : claimOwner(launches, key, at)
     if (launches !== undefined && from < 0) continue
-    const owner = from < 0 ? '' : `${label}\u0000${from}` // which launch: its label and its time
+    const owner = from < 0 ? '' : `${key}\u0000${from}` // which launch: its label key and its time
     const run: CodexRun = {
       label,
       at,
@@ -702,39 +722,25 @@ export function saneCodex(raw: unknown): MeterCodex {
   if (!Array.isArray(r.launches)) return EMPTY_CODEX
   const t = isRec(r.totals) ? r.totals : {}
   const count = (v: unknown): number => Math.max(0, fin(v, 0))
-  const runs = rows(r.runs).flatMap((x): CodexRun[] =>
-    typeof x.label === 'string'
-      ? [
-          {
-            label: codexLabel(x.label) || 'review',
-            at: count(x.at),
-            durationS: count(x.durationS),
-            input: count(x.input),
-            cached: count(x.cached),
-            output: count(x.output),
-            auth: pick(x.auth, CODEX_AUTH, 'none'),
-            fellBack: x.fellBack === true,
-            exitCode: finOrNull(x.exitCode),
-            skip: codexSkip(strOr(x.skip)),
-          },
-        ]
-      : [],
-  )
 
   return {
-    runs: runs.slice(-MAX_CODEX_RUNS),
     totals: { runs: count(t.runs), durationS: count(t.durationS), input: count(t.input), cached: count(t.cached), output: count(t.output), usd: count(t.usd) },
     tooBig: r.tooBig === true,
     launches: rows(r.launches)
       .flatMap((x): CodexLaunch[] => {
-        const label = typeof x.label === 'string' ? codexLabel(x.label) : ''
+        const key = typeof x.key === 'string' ? clean(x.key).slice(0, MAX_LABEL_KEY + 2) : ''
         const at = fin(x.at, -1)
 
-        return label !== '' && at >= 0 ? [{ label, at }] : []
+        return key !== '' && at >= 0 ? [{ key, at }] : []
       })
       .slice(-MAX_LAUNCHES),
     planDoneAt: (Array.isArray(r.planDoneAt) ? r.planDoneAt : []).filter((n): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0).slice(-MAX_CODEX_PLAN),
   }
+}
+
+/** What the atom keeps of a parse: the rows are for the parser's caller only, nothing draws them. */
+function stored(parsed: MeterCodex & { runs: CodexRun[] }): MeterCodex {
+  return { totals: parsed.totals, planDoneAt: parsed.planDoneAt, launches: parsed.launches, tooBig: parsed.tooBig }
 }
 
 async function readCodex($: Dollar): Promise<MeterCodex> {
@@ -789,7 +795,7 @@ async function refreshCodex($: Dollar): Promise<void> {
     }
     const text = await $.fs.read(path)
     // Parsed inside the write, so a launch noted while the file was being read is in the claim.
-    await update($, codexAtom, c => parseCodex(text, startedAt, saneCodex(c).launches))
+    await update($, codexAtom, c => stored(parseCodex(text, startedAt, saneCodex(c).launches)))
   } catch {
     // reading is a courtesy; a failed read leaves what the pane has
   } finally {
@@ -823,9 +829,37 @@ export function shellSegments(command: string): string[][] {
     if (words.length > 0) out.push(words)
     words = []
   }
+  const heredocs: { word: string; strip: boolean }[] = [] // `<<WORD` seen on this line: their bodies start after its line break
   for (let i = 0; i < text.length; i++) {
     const c = text.charAt(i)
     const next = text.charAt(i + 1)
+    if (quote === '' && c === '<' && next === '<' && text.charAt(i + 2) !== '<' && text.charAt(i - 1) !== '<') {
+      // `<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`, `<<\\WORD`: note the word; the body is skipped at the line break.
+      const m = /^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([A-Za-z0-9_.-]+))/.exec(text.slice(i, i + 200))
+      if (m !== null) {
+        heredocs.push({ word: m[2] ?? m[3] ?? m[4] ?? '', strip: m[1] === '-' })
+        endWord()
+        i += m[0].length - 1
+
+        continue
+      }
+    }
+    if (quote === '' && c === '\n' && heredocs.length > 0) {
+      endCommand()
+      let at = i + 1
+      for (const h of heredocs) {
+        while (at < text.length) {
+          const end = text.indexOf('\n', at)
+          const line = text.slice(at, end < 0 ? text.length : end)
+          at = end < 0 ? text.length : end + 1
+          if ((h.strip ? line.replace(/^\t+/, '') : line) === h.word) break
+        }
+      }
+      heredocs.length = 0
+      i = at - 1
+
+      continue
+    }
     if (quote === "'") {
       if (c === "'") quote = ''
       else word += c
@@ -884,7 +918,7 @@ export function codexLaunchesIn(command: string): string[] {
       if (a === '--label') label = args[i + 1]
       else if (a.startsWith('--label=')) label = a.slice('--label='.length)
     }
-    const name = codexLabel((label ?? '').trim())
+    const name = clean(label ?? '').trim().slice(0, MAX_LABEL_KEY)
     if (name !== '') labels.push(name)
   }
 
@@ -898,7 +932,7 @@ async function noteCodexLaunches($: Dollar, command: string): Promise<CodexLaunc
   const now = await readNow($)
   if (!(now > 0)) return []
   const at = Math.floor(now / 1000) * 1000 // the log's timestamps are whole seconds
-  const added = labels.map((label): CodexLaunch => ({ label, at }))
+  const added = labels.map((label): CodexLaunch => ({ key: codexLabelKey(label), at }))
   await update($, codexAtom, c => {
     const s = saneCodex(c)
 
@@ -914,7 +948,7 @@ async function forgetCodexLaunches($: Dollar, gone: CodexLaunch[]): Promise<void
   await update($, codexAtom, c => {
     const s = saneCodex(c)
 
-    return { ...s, launches: s.launches.filter(l => !gone.some(g => g.label === l.label && g.at === l.at)) }
+    return { ...s, launches: s.launches.filter(l => !gone.some(g => g.key === l.key && g.at === l.at)) }
   })
   launchEpoch++
 }
@@ -1826,7 +1860,7 @@ function cacheTile(k: Kit, l: Layout, d: MeterData): RenderElement[] {
 
 // -- 1b. Limits: what is left of the Claude windows and of the Codex plan ------
 /** One Claude rate-limit window the engine reported: percent LEFT and when it resets (ms), null when it did not say or it is past. */
-export type ClaudeWindow = { kind: 'five_hour' | 'seven_day'; leftPct: number; resetsAt: number | null }
+export type ClaudeWindow = { kind: 'five_hour' | 'seven_day'; leftPct: number | null; resetsAt: number | null }
 
 /**
  * The engine's rate-limit windows as the row draws them: only `five_hour` and `seven_day`, the first of each,
@@ -1838,7 +1872,9 @@ export function claudeWindows(raw: unknown, now: number): ClaudeWindow[] {
     const w = rows(raw).find(x => x.kind === kind && typeof x.percentUsed === 'number' && Number.isFinite(x.percentUsed))
     if (w === undefined) continue
     const when = typeof w.resetsAt === 'string' ? Date.parse(w.resetsAt) : Number.NaN
-    out.push({ kind, leftPct: clamp(100 - fin(w.percentUsed, 100), 0, 100), resetsAt: Number.isFinite(when) && when > now ? when : null })
+    // A window whose reset time has passed no longer holds the percentage the last response reported: no number.
+    const over = Number.isFinite(when) && when <= now
+    out.push({ kind, leftPct: over ? null : clamp(100 - fin(w.percentUsed, 100), 0, 100), resetsAt: Number.isFinite(when) && when > now ? when : null })
   }
 
   return out
@@ -1861,7 +1897,7 @@ export function claudeLimitLines(windows: ClaudeWindow[], room = Number.POSITIVE
   const full = dated.map(w => `${names[w.kind]} resets ${resetText(w.at, w.kind === 'five_hour')}`).join(' · ')
   const short = dated.map(w => (w.kind === 'five_hour' ? `5h ${resetText(w.at, true)}` : `wk ${resetText(w.at).replace(/ \d\d\/\d\d /, ' ')}`)).join(' · ')
 
-  return { main: `Claude · ${windows.map(w => `${names[w.kind]} ${pctText(w.leftPct)}% left`).join(' · ')}`, resets: full.length <= room ? full : short }
+  return { main: `Claude · ${windows.map(w => (w.leftPct === null ? `${names[w.kind]} has reset` : `${names[w.kind]} ${pctText(w.leftPct)}% left`)).join(' · ')}`, resets: full.length <= room ? full : short }
 }
 
 /**
@@ -1944,7 +1980,7 @@ function topSection(k: Kit, l: Layout, d: MeterData, codex: MeterCodex, windows:
   const costTile = ranCodex
     ? tile(
         'Session cost',
-        big(k, pickFit(usd(d.costUsd + codex.totals.usd), usdShort(d.costUsd + codex.totals.usd))),
+        big(k, pickFit(usd(addUsd(d.costUsd, codex.totals.usd)), usdShort(addUsd(d.costUsd, codex.totals.usd)))),
         caption(k, pickFit(`Claude ${usd(d.costUsd)}`, `Claude ${usdShort(d.costUsd)}`, usdShort(d.costUsd))),
         caption(k, pickFit(`Codex ≈${usd(codex.totals.usd)} API-eq`, `Codex ≈${usd(codex.totals.usd)}`, `Codex ≈${usdShort(codex.totals.usd)}`, `≈${usdShort(codex.totals.usd)}`)),
       )
@@ -2172,7 +2208,7 @@ function workSection(k: Kit, l: Layout, d: MeterData, codex: MeterCodex): Render
     'Who did the work',
     caption(k, cx === undefined ? '≈ split of the session total by step · tokens exact' : '≈ split of the session total · Codex at API price · tokens exact'),
     barLabel(k, 'Cost'),
-    stacked(costItems, `Cost by who did the work, total ${usd(d.costUsd + (cxShown && cx !== undefined ? cx.usd : 0))}`),
+    stacked(costItems, `Cost by who did the work, total ${usd(addUsd(d.costUsd, cxShown && cx !== undefined ? cx.usd : 0))}`),
     <Box marginTop={1} flexDirection="column">
       {barLabel(k, 'Tokens written')}
       {stacked(tokenItems, 'Tokens written by who did the work')}

@@ -3,9 +3,9 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import type { CodexLaunch, MeterCodex, MeterData, MeterGroup, MeterPr } from '../types'
+import type { CodexLaunch, CodexRun, MeterCodex, MeterData, MeterGroup, MeterPr } from '../types'
 
-import { addToGroups, agentRow, agoText, barSvg, beforeLoaded, claimed, claudeLimitLines, claudeWindows, CODEX_COLOR, codexCost, codexLabel, codexSkip, MODEL_COLOR, usdShort, codexEstimate, codexLaunchesIn, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, clean, niceTicks, niceTop, PALETTES, paletteFor, parseCodex, parseCodexArgs, parseCsv, parseDuration, parsePercent, PRICE_RATIO, prUrlsIn, resetText, saneCodex, saneLimits, ringSvg, rollup, sane, sanePrs, shellSegments, shares, splitCost, splitParts, stackCells, summary, tokens, truncate } from './register'
+import { addToGroups, agentRow, agoText, barSvg, beforeLoaded, claimed, claudeLimitLines, claudeWindows, addUsd, CODEX_COLOR, codexCost, codexLabel, codexLabelKey, codexSkip, MODEL_COLOR, usdShort, codexEstimate, codexLaunchesIn, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, clean, niceTicks, niceTop, PALETTES, paletteFor, parseCodex, parseCodexArgs, parseCsv, parseDuration, parsePercent, PRICE_RATIO, prUrlsIn, resetText, saneCodex, saneLimits, ringSvg, rollup, sane, sanePrs, shellSegments, shares, splitCost, splitParts, stackCells, summary, tokens, truncate } from './register'
 
 const PANE = {
   plugin: 'meter',
@@ -2800,19 +2800,19 @@ test('parseCodex hides rows before the session start and counts skipped rows apa
   expect(out.planDoneAt).toEqual([T0 - 120 * MIN, T0])
 })
 
-test('saneCodex repairs a stored value: bad rows dropped, numbers finite, labels cleaned again', () => {
+test('saneCodex repairs a stored value: numbers finite, no rows kept (a leftover `runs` from codex-2 is ignored)', () => {
   const out = saneCodex({ runs: [{ label: 'a\nb', at: Number.NaN, input: -4, auth: 'x', skip: 5 }, { nolabel: true }, 7], totals: { runs: 'many' }, planDoneAt: [1, 'x', Number.NaN, -3], launches: [] })
 
-  expect(out.runs).toEqual([{ label: 'a b', at: 0, durationS: 0, input: 0, cached: 0, output: 0, auth: 'none', fellBack: false, exitCode: null, skip: '' }])
+  expect('runs' in out).toBe(false)
   expect(out.totals.runs).toBe(0)
   expect(out.planDoneAt).toEqual([1])
-  expect(saneCodex(undefined).runs).toEqual([])
+  expect(saneCodex(undefined)).toEqual(emptyCodex())
 })
 
 // -- helpers for the v1.2.0 tests: launches, seeded stores, the Bash call that starts a review -------------
 const REVIEW = (label: string, extra = '') => `bash .claude/bin/codex-review.sh --repo . --base main --head HEAD ${extra}--label ${label}`
 const bash = ($: Engine, command: string, agentId?: string) => $.tool.call({ tool: 'Bash', command, ...(agentId === undefined ? {} : { agentId }) })
-const launch = (label: string, minutes: number): CodexLaunch => ({ label, at: T0 + minutes * MIN })
+const launch = (label: string, minutes: number): CodexLaunch => ({ key: codexLabelKey(label), at: T0 + minutes * MIN })
 /** Like `codexSetup`, but the clock starts at T0 + 1 min, each label is launched there, then the clock moves to T0 + 10 min. */
 const launchedSetup = async ($: Engine, on: On, labels: string[], world: Partial<CodexWorld> = {}, entries: Record<string, unknown> = {}) => {
   const s = codexSetup(on, { clockAt: T0 + MIN, ...world }, entries)
@@ -2837,10 +2837,10 @@ const memoryState = (on: On, seed: Record<string, unknown> = {}) => {
 
   return mem
 }
-const emptyCodex = (over: Partial<MeterCodex> = {}): MeterCodex => ({ runs: [], totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [], launches: [], tooBig: false, ...over })
-const runOf = (over: Partial<MeterCodex['runs'][number]> = {}): MeterCodex['runs'][number] => ({ label: 'acme/web-api#12', at: T0, durationS: 206, input: 428_723, cached: 382_208, output: 2_758, auth: 'plan', fellBack: false, exitCode: 0, skip: '', ...over })
-/** A stored `codex-2` value, as the atom holds it: pass the event so the right atom is served. */
-const storedCodex = (fixture: Fixture, codex: MeterCodex, e: { key: string }) => (e.key === 'codex' ? { value: { version: 1, value: { shape: 'codex-2', value: codex } } } : stored(fixture, e))
+const emptyCodex = (over: Partial<MeterCodex> = {}): MeterCodex => ({ totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [], launches: [], tooBig: false, ...over })
+const runOf = (over: Partial<CodexRun> = {}): CodexRun => ({ label: 'acme/web-api#12', at: T0, durationS: 206, input: 428_723, cached: 382_208, output: 2_758, auth: 'plan', fellBack: false, exitCode: 0, skip: '', ...over })
+/** A stored `codex-3` value, as the atom holds it: pass the event so the right atom is served. */
+const storedCodex = (fixture: Fixture, codex: MeterCodex, e: { key: string }) => (e.key === 'codex' ? { value: { version: 1, value: { shape: 'codex-3', value: codex } } } : stored(fixture, e))
 const WIDE = { ...PANE.props, bodyColumns: 120 }
 
 test('shellSegments: quotes come off, ; & | and line breaks cut the command, a backslash escapes, a long command is read only so far', () => {
@@ -2862,7 +2862,8 @@ test('codexLaunchesIn reads the label bare, in single quotes, in double quotes a
   expect(codexLaunchesIn(`cd . && ${run} --label a#3 & ${run} --label a#4`)).toEqual(['a#3', 'a#4'])
   expect(codexLaunchesIn(`FOO=1 nohup timeout 600 bash ${run} --label a#5 > out.log 2>&1 &`)).toEqual(['a#5']) // the redirect and the & after the label do not hide it
   expect(codexLaunchesIn(`./codex-review.sh --label a#6`)).toEqual(['a#6'])
-  expect(codexLaunchesIn(`${run} --label '${'x'.repeat(80)}'`)[0]?.length).toBe(40) // cut as the log's label is
+  expect(codexLaunchesIn(`${run} --label '${'x'.repeat(80)}'`)[0]?.length).toBe(80) // whole: it is matched whole, and only drawn cut to 40
+  expect(codexLaunchesIn(`${run} --label '${'x'.repeat(300)}'`)[0]?.length).toBe(200)
   expect(codexLaunchesIn(`${run} --label 'a\u0007b'`)).toEqual(['a b']) // control characters are cleaned
   // not launches
   expect(codexLaunchesIn(`${run} --classify --label a#7`)).toEqual([]) // `--classify` is a question, not a review
@@ -2908,9 +2909,10 @@ test('parseCodex with launches: only claimed rows count, one launch takes a plan
 })
 
 test('saneCodex keeps the launches repaired, and a codex-1 value (rows, no launches) comes back empty', () => {
-  const out = saneCodex({ ...emptyCodex(), launches: [{ label: 'a\nb', at: 5 }, { label: 'ok', at: Number.NaN }, { label: 7, at: 1 }, { at: 2 }, 'x', { label: 'c', at: -1 }] })
-  expect(out.launches).toEqual([{ label: 'a b', at: 5 }])
-  expect(saneCodex({ ...emptyCodex(), launches: Array.from({ length: 150 }, (_, i) => ({ label: `l${i}`, at: i })) }).launches).toHaveLength(100)
+  const out = saneCodex({ ...emptyCodex(), launches: [{ key: 'a\nb', at: 5 }, { key: 'ok', at: Number.NaN }, { key: 7, at: 1 }, { at: 2 }, 'x', { key: 'c', at: -1 }, { label: 'old', at: 3 }] })
+  expect(out.launches).toEqual([{ key: 'a b', at: 5 }]) // a codex-2 launch (a `label`, no `key`) is dropped
+  expect(saneCodex({ ...emptyCodex(), launches: Array.from({ length: 600 }, (_, i) => ({ key: `l${i}`, at: i })) }).launches).toHaveLength(500)
+  expect(saneCodex({ ...emptyCodex(), launches: [{ key: 'x'.repeat(500), at: 1 }] }).launches[0]?.key.length).toBe(202)
   // what codex-1 stored: machine-wide rows, no launches
   const old = { runs: [{ label: 'acme/web-api#12', at: T0, durationS: 1, input: 9, cached: 0, output: 1, auth: 'plan', fellBack: false, exitCode: 0, skip: '' }], totals: { runs: 3, durationS: 9, input: 9, cached: 0, output: 1, usd: 5 }, planDoneAt: [1, 2], tooBig: false }
   expect(saneCodex(old)).toEqual(emptyCodex())
@@ -2925,7 +2927,7 @@ test('summary: with Codex the session total is Claude + Codex on one line, witho
   expect(withCx.includes('\n')).toBe(false)
   expect(summary(d, [])).toContain('Session $10.65 · context')
   expect(summary(d, [], emptyCodex())).not.toContain('Codex')
-  expect(summary(d, [], emptyCodex({ runs: [runOf({ skip: 'no_code' })] }))).not.toContain('Codex') // only skipped rows: no run ran
+  expect(summary(d, [], emptyCodex({ totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 } }))).not.toContain('Codex') // only skipped rows: no run ran
 })
 
 // -- attribution: which log rows are this session's -----------------------------------------------------
@@ -3036,27 +3038,27 @@ test('a review a subagent launches counts, and one the permission check denies d
   await ui.unmount()
 })
 
-test('launches are kept in the codex-2 atom, and a fresh load with that stored value claims its rows', async ($, on) => {
+test('launches are kept in the codex-3 atom, and a fresh load with that stored value claims its rows', async ($, on) => {
   const { w } = codexSetup(on, { clockAt: T0 + MIN })
   const mem = memoryState(on)
   await startSession($)
   await bash($, REVIEW('acme/web-api#12'))
   const first = mem.get('codex') as { shape: string; value: MeterCodex }
-  expect(first.shape).toBe('codex-2')
-  expect(first.value.launches).toEqual([{ label: 'acme/web-api#12', at: T0 + MIN }])
+  expect(first.shape).toBe('codex-3')
+  expect(first.value.launches).toEqual([{ key: 'acme/web-api#12', at: T0 + MIN }])
   // the new launch is not lost when the log is read: parse inside the write, launches kept
   w.csv = csvOf(csvRow({ timestamp: at(3) }))
   w.mtime = 2
   await runMeter($, '')
   const again = mem.get('codex') as { value: MeterCodex }
-  expect(again.value.launches).toEqual([{ label: 'acme/web-api#12', at: T0 + MIN }])
+  expect(again.value.launches).toEqual([{ key: 'acme/web-api#12', at: T0 + MIN }])
   expect(again.value.totals.runs).toBe(1)
 })
 
 test('after a reload the stored launches still claim rows (the value in the atom is all it needs)', async ($, on) => {
   const kept = emptyCodex({ launches: [launch('acme/web-api#12', 1)] })
   const { w } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(3) }), csvRow({ timestamp: at(4), label: 'acme/other#1' })) })
-  memoryState(on, { codex: { shape: 'codex-2', value: kept } })
+  memoryState(on, { codex: { shape: 'codex-3', value: kept } })
   await startSession($) // a module that has just loaded: nothing in memory, the launch is in the atom
   expect(w.reads).toHaveLength(1)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: WIDE })
@@ -3125,7 +3127,12 @@ test('claudeWindows keeps the 5-hour and weekly windows with a reading, as perce
     { kind: 'five_hour', leftPct: 62, resetsAt: Date.parse('2026-11-09T12:00:00Z') },
     { kind: 'seven_day', leftPct: 79.5, resetsAt: Date.parse('2026-11-15T11:20:00Z') },
   ])
-  expect(claudeWindows([rl('seven_day', 130, '2026-11-09T09:00:00Z')], now)).toEqual([{ kind: 'seven_day', leftPct: 0, resetsAt: null }]) // over 100 used: 0 left; a past reset is not shown
+  expect(claudeWindows([rl('seven_day', 130, '2026-11-09T11:00:00Z')], now)).toEqual([{ kind: 'seven_day', leftPct: 0, resetsAt: Date.parse('2026-11-09T11:00:00Z') }]) // over 100 used: 0 left
+  // a window whose reset time has passed holds no percentage any more: it has reset
+  expect(claudeWindows([rl('five_hour', 98, '2026-11-09T09:59:59Z'), rl('seven_day', 20, '2026-11-09T10:00:00Z')], now)).toEqual([
+    { kind: 'five_hour', leftPct: null, resetsAt: null },
+    { kind: 'seven_day', leftPct: null, resetsAt: null },
+  ])
   expect(claudeWindows([rl('five_hour', Number.NaN), { kind: 'seven_day' }, { kind: 'five_hour', percentUsed: 'x' }, 'no', null], now)).toEqual([])
   expect(claudeWindows([rl('five_hour', 10, 'tomorrow')], now)).toEqual([{ kind: 'five_hour', leftPct: 90, resetsAt: null }])
   expect(claudeWindows(undefined, now)).toEqual([])
@@ -3330,7 +3337,7 @@ test('the codex agent row: "codex ×N · GPT", input tokens read, output tokens 
 
 // what codex-1 stored: rows from the whole machine, no launches
 const OLD_CODEX = { runs: [runOf()], totals: { runs: 5, durationS: 9, input: 9_000_000, cached: 0, output: 500_000, usd: 99 }, planDoneAt: [T0], tooBig: true }
-for (const shape of ['codex-1', 'codex-2'] as const) {
+for (const shape of ['codex-1', 'codex-2', 'codex-3'] as const) {
   test(`a stored ${shape} value in the old format (rows, no launches) never crashes the pane and shows nothing: declined by its tag, or emptied`, async ($, on) => {
     on('state.get', (_, e) => (e.key === 'codex' ? { value: { version: 1, value: { shape, value: OLD_CODEX } } } : stored(live(), e)))
     for (const surface of ['terminal', 'desktop'] as const) {
@@ -3369,8 +3376,7 @@ test('11 launched runs: the atom keeps the last 8, the total, the bar and the ag
   await setup.clock.set(T0 + 10 * MIN)
   await startSession($)
   const kept = (mem.get('codex') as { value: MeterCodex }).value
-  expect(kept.runs).toHaveLength(8)
-  expect(kept.runs.at(-1)?.label).toBe('acme/web-api#11')
+  expect('runs' in kept).toBe(false) // the rows are not stored: nothing draws them
   expect(kept.totals.runs).toBe(11)
   expect(kept.launches).toHaveLength(11)
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -3715,22 +3721,24 @@ test('a skip reason keeps only what is before the first colon: "reused:/Users/x/
   const out = parseCodex(csvOf(row), 0)
   expect(out.runs[0]?.skip).toBe('reused')
   expect(JSON.stringify(out)).not.toContain('/Users/')
-  const fixed = saneCodex({ ...emptyCodex(), runs: [{ label: 'a', at: 1, skip: 'reused:/Users/x/y' }] })
-  expect(fixed.runs[0]?.skip).toBe('reused')
-  expect(JSON.stringify(fixed)).not.toContain('/Users/')
+  expect(JSON.stringify(saneCodex({ ...emptyCodex(), runs: [{ label: 'a', at: 1, skip: 'reused:/Users/x/y' }] }))).not.toContain('/Users/') // an old stored row is not kept at all
 })
 
 test('a label keeps no e-mail address and no path: in the parse, in a stored value and in a launch, so they still match', () => {
-  expect(codexLabel('/Users/jdoe/src/web-api')).toBe('web-api')
-  expect(codexLabel('~/src/web-api/')).toBe('web-api')
+  expect(codexLabel('/Users/jdoe/src/web-api')).toBe('…')
+  expect(codexLabel('~/src/web-api/')).toBe('…')
   expect(codexLabel('dev@example.com')).toBe('…')
-  expect(codexLabel('ping dev@example.com now')).toBe('ping … now')
+  expect(codexLabel('ping dev@example.com now')).toBe('…')
   expect(codexLabel('acme/web-api#12')).toBe('acme/web-api#12') // a repo/PR label is not a path
   const out = parseCodex(csvOf(csvRow({ timestamp: at(2), label: '/Users/jdoe/src/web-api' }), csvRow({ timestamp: at(3), label: 'dev@example.com' })), 0)
-  expect(out.runs.map(r => r.label)).toEqual(['web-api', '…'])
-  expect(JSON.stringify(saneCodex({ ...emptyCodex(), runs: [{ label: '/Users/jdoe/x' }], launches: [{ label: 'dev@example.com', at: 1 }] }))).not.toMatch(/Users|@/)
-  expect(codexLaunchesIn('.claude/bin/codex-review.sh --label /Users/jdoe/src/web-api')).toEqual(['web-api'])
-  expect(parseCodex(csvOf(csvRow({ timestamp: at(2), label: '/Users/jdoe/src/web-api' })), 0, [launch('web-api', 1)]).totals.runs).toBe(1)
+  expect(out.runs.map(r => r.label)).toEqual(['…', '…'])
+  // what a launch stores is a hash, never the text
+  expect(launch('dev@example.com', 1).key).toMatch(/^h:[0-9a-f]{16}$/)
+  expect(launch('/Users/jdoe/src/web-api', 1).key).toMatch(/^h:[0-9a-f]{16}$/)
+  expect(JSON.stringify([launch('dev@example.com', 1), launch('/Users/jdoe/src/web-api', 1)])).not.toMatch(/Users|@|example/)
+  expect(codexLabelKey('dev@example.com')).toBe(codexLabelKey(' dev@example.com ')) // the same text, the same key
+  expect(codexLaunchesIn('.claude/bin/codex-review.sh --label /Users/jdoe/src/web-api')).toEqual(['/Users/jdoe/src/web-api']) // read for matching only; only its hash is stored
+  expect(parseCodex(csvOf(csvRow({ timestamp: at(2), label: '/Users/jdoe/src/web-api' })), 0, [launch('/Users/jdoe/src/web-api', 1)]).totals.runs).toBe(1)
 })
 
 test('totals.runs counts reviews, not rows: a failed row followed by an API fallback from the same launch is one; tokens and dollars add up every row', () => {
@@ -3815,4 +3823,90 @@ test('claudeLimitLines labels the reset times, and shortens them where they do n
   expect(claudeLimitLines([windows[0] as (typeof windows)[number]], 40)?.resets).toBe('5h resets 14:00')
   expect(claudeLimitLines([windows[1] as (typeof windows)[number]], 40)?.resets).toBe('week resets Sun 15/11 12:20')
   expect(claudeLimitLines([{ kind: 'five_hour', leftPct: 62, resetsAt: null }])?.resets).toBe('')
+  expect(claudeLimitLines([{ kind: 'five_hour', leftPct: null, resetsAt: null }, { kind: 'seven_day', leftPct: 80, resetsAt: week }])?.main).toBe('Claude · 5h has reset · week 80% left')
+  expect(claudeLimitLines([{ kind: 'five_hour', leftPct: null, resetsAt: null }])?.main).not.toMatch(/%/)
+})
+
+// -- review round: stale Claude windows, whole-label matching, 500 launches, heredocs, rounding ------------------
+test('the limits row says "5h has reset" and shows no stale percentage once the window\'s reset time has passed', async ($, on) => {
+  const now = T0 + 10 * MIN
+  codexSetup(on, { clockAt: now, rateLimits: [rl('five_hour', 98, new Date(now - 30 * MIN).toISOString()), rl('seven_day', 20, new Date(now + 5 * 24 * 60 * MIN).toISOString())] })
+  await startSession($)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface, props: WIDE })
+    const lines = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    expect(lines).toContain('Claude · 5h has reset · week 80% left')
+    expect(lines.join('\n')).not.toMatch(/2% left/)
+    expect(lines.some(l => /^week resets /.test(l))).toBe(true) // only the window still ahead has a reset line
+    await ui.unmount()
+  }
+})
+
+test('two long labels that differ only after character 40 are two launches: a row is claimed by its own, not the other', () => {
+  const a = `acme/web-api#${'x'.repeat(40)}-first`
+  const b = `acme/web-api#${'x'.repeat(40)}-second`
+  expect(a.slice(0, 40)).toBe(b.slice(0, 40))
+  expect(codexLabelKey(a)).not.toBe(codexLabelKey(b))
+  expect(codexLabel(a)).toBe(codexLabel(b)) // drawn alike, matched apart
+  const rows = csvOf(csvRow({ timestamp: at(2), label: a }), csvRow({ timestamp: at(3), label: b }))
+  expect(parseCodex(rows, 0, [launch(a, 1)]).totals.runs).toBe(1)
+  expect(parseCodex(rows, 0, [launch(a, 1), launch(b, 1)]).totals.runs).toBe(2)
+  expect(parseCodex(rows, 0, [launch(`${a}-other`, 1)]).totals.runs).toBe(0)
+})
+
+test('two different e-mail labels (or two different paths) are not mixed up, and each is drawn as … only', () => {
+  const rows = csvOf(csvRow({ timestamp: at(2), label: 'dev@example.com' }), csvRow({ timestamp: at(3), label: 'other@example.com' }), csvRow({ timestamp: at(4), label: '/Users/a/web' }), csvRow({ timestamp: at(5), label: '/Users/b/web' }))
+  expect(parseCodex(rows, 0, [launch('dev@example.com', 1)]).totals.runs).toBe(1)
+  expect(parseCodex(rows, 0, [launch('other@example.com', 1)]).totals.runs).toBe(1)
+  expect(parseCodex(rows, 0, [launch('/Users/a/web', 1)]).totals.runs).toBe(1)
+  expect(parseCodex(rows, 0, [launch('dev@example.com', 1), launch('other@example.com', 1), launch('/Users/a/web', 1), launch('/Users/b/web', 1)]).totals.runs).toBe(4)
+  expect(parseCodex(rows, 0, [launch('third@example.com', 1)]).totals.runs).toBe(0)
+  expect(launch('dev@example.com', 1).key).not.toBe(launch('other@example.com', 1).key)
+  expect(launch('/Users/a/web', 1).key).not.toBe(launch('/Users/b/web', 1).key)
+})
+
+test('101 launches: the first one still claims its row (the cap is 500, as many as the log records looked at)', async ($, on) => {
+  const labels = Array.from({ length: 101 }, (_, i) => `acme/web-api#${i}`)
+  const { w } = codexSetup(on, { clockAt: T0 + MIN })
+  const mem = memoryState(on)
+  for (const label of labels) await bash($, REVIEW(label))
+  expect((mem.get('codex') as { value: MeterCodex }).value.launches).toHaveLength(101)
+  w.csv = csvOf(csvRow({ timestamp: at(3), label: labels[0] ?? '' }))
+  w.mtime = 2
+  await startSession($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: WIDE })
+  expect((await agentRows(ui)).map(a => a.left)).toEqual(['codex · GPT'])
+  await ui.unmount()
+})
+
+test('shellSegments skips here-document bodies: a script name inside `cat <<EOF` text is not a command', () => {
+  const script = '.claude/bin/codex-review.sh --repo . --base main --head HEAD'
+  expect(codexLaunchesIn(`cat <<'EOF' > notes.md\n${script} --label a#1\nEOF\n`)).toEqual([])
+  expect(codexLaunchesIn(`cat <<EOF\n${script} --label a#2\nEOF`)).toEqual([])
+  expect(codexLaunchesIn(`cat <<"EOF"\n${script} --label a#3\nEOF\n`)).toEqual([])
+  expect(codexLaunchesIn(`cat <<-EOF\n\t${script} --label a#4\n\tEOF\n`)).toEqual([])
+  expect(codexLaunchesIn(`cat <<'EOF'\nline one\n${script} --label a#5\nEOF\n${script} --label a#6`)).toEqual(['a#6']) // the command after the body counts
+  expect(codexLaunchesIn(`${script} --label a#7 <<EOF\nbody\nEOF`)).toEqual(['a#7']) // the call is on the line with the `<<`
+  expect(codexLaunchesIn(`cat <<A <<B\n${script} --label a#8\nA\n${script} --label a#9\nB\n`)).toEqual([]) // two bodies, both skipped
+  expect(codexLaunchesIn(`cat <<EOF\n${script} --label a#10`)).toEqual([]) // never closed: the rest is the body
+  expect(codexLaunchesIn(`cat <<<"${script} --label a#11"`)).toEqual([]) // a here-string is a quoted word, not a command
+  expect(codexLaunchesIn(`echo hi; ${script} --label a#12 <<<'x'`)).toEqual(['a#12'])
+  expect(shellSegments("cat <<'EOF'\nrm -rf x\nEOF\nls")).toEqual([['cat'], ['ls']])
+})
+
+test('the session total adds the parts as they are drawn: $12.39 = $10.65 + $1.74 even when the raw sum rounds the other way', async ($, on) => {
+  expect(addUsd(10.654, 1.744)).toBe(12.39) // raw 12.398 would read $12.40
+  expect(addUsd(0.004, 0.004)).toBe(0)
+  const d = sane(live({ costUsd: 10.654 }))
+  const cx = emptyCodex({ totals: { runs: 1, durationS: 1, input: 1, cached: 0, output: 1, usd: 1.744 } })
+  expect(summary(d, [], cx)).toContain('Session $12.39 (Claude $10.65 + Codex ≈$1.74 API-eq)')
+  on('state.get', (_, e) => storedCodex(live({ costUsd: 10.654 }), cx, e))
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface, props: WIDE })
+    const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    expect(texts).toContain('$12.39')
+    expect(texts).toContain('Claude $10.65')
+    expect(texts.some(t => /^Codex ≈\$1\.74/.test(t))).toBe(true)
+    await ui.unmount()
+  }
 })
