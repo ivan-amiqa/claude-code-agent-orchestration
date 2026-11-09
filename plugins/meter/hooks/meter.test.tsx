@@ -5,7 +5,7 @@ import type { On } from 'claude-code'
 
 import type { CodexLaunch, MeterCodex, MeterData, MeterGroup, MeterPr } from '../types'
 
-import { addToGroups, agentRow, agoText, barSvg, beforeLoaded, claimed, claudeLimitLines, claudeWindows, codexCost, codexEstimate, codexLaunchesIn, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, clean, niceTicks, niceTop, PALETTES, paletteFor, parseCodex, parseCodexArgs, parseCsv, parseDuration, parsePercent, PRICE_RATIO, prUrlsIn, resetText, saneCodex, saneLimits, ringSvg, rollup, sane, sanePrs, shellSegments, shares, splitCost, splitParts, stackCells, summary, tokens, truncate } from './register'
+import { addToGroups, agentRow, agoText, barSvg, beforeLoaded, claimed, claudeLimitLines, claudeWindows, CODEX_COLOR, codexCost, codexLabel, codexSkip, MODEL_COLOR, usdShort, codexEstimate, codexLaunchesIn, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, clean, niceTicks, niceTop, PALETTES, paletteFor, parseCodex, parseCodexArgs, parseCsv, parseDuration, parsePercent, PRICE_RATIO, prUrlsIn, resetText, saneCodex, saneLimits, ringSvg, rollup, sane, sanePrs, shellSegments, shares, splitCost, splitParts, stackCells, summary, tokens, truncate } from './register'
 
 const PANE = {
   plugin: 'meter',
@@ -2898,8 +2898,8 @@ test('parseCodex with launches: only claimed rows count, one launch takes a plan
   const out = parseCodex(csvOf(before, mine, other, fallback), T0 - MIN, [launch('acme/web-api#12', 1)])
 
   expect(out.runs.map(r => [r.label, r.auth])).toEqual([['acme/web-api#12', 'plan'], ['acme/web-api#12', 'api']])
-  expect(out.totals.runs).toBe(2)
-  expect(close(out.totals.usd, 0.159)).toBe(true) // only the fallback had tokens
+  expect(out.totals.runs).toBe(1) // one review: the failed plan run and its API fallback are the same launch
+  expect(close(out.totals.usd, 0.159)).toBe(true) // only the fallback had tokens; every row's tokens still add up
   expect(out.launches).toEqual([launch('acme/web-api#12', 1)])
   // the limit is account-wide: every plan run that finished, claimed or not
   expect(out.planDoneAt).toEqual([T0 - 5 * MIN, T0 + 3 * MIN])
@@ -2974,7 +2974,7 @@ test('a row stamped before the launch is not claimed, even with the same label',
   await ui.unmount()
 })
 
-test('one launch claims a plan run that failed and the API fallback it wrote: two runs, one Codex row', async ($, on) => {
+test('one launch claims a plan run that failed and the API fallback it wrote: two rows, ONE review, one Codex row', async ($, on) => {
   await launchedSetup($, on, ['acme/web-api#12'], {
     csv: csvOf(
       csvRow({ timestamp: at(3), exit_code: '3', input_tokens: '', cached_input_tokens: '', output_tokens: '', duration_s: '40' }),
@@ -2984,7 +2984,7 @@ test('one launch claims a plan run that failed and the API fallback it wrote: tw
   await startSession($)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: WIDE })
   const agents = await agentRows(ui)
-  expect(agents.map(a => a.left)).toEqual(['codex ×2 · GPT'])
+  expect(agents.map(a => a.left)).toEqual(['codex · GPT']) // not "×2": the review is counted once
   expect(agents[0]?.cost).toBe('≈$0.16') // only the fallback had tokens
   await ui.unmount()
 })
@@ -3155,7 +3155,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const lines = (await ui.findAll({ type: 'Text' })).map(t => t.text)
     const text = lines.join('\n')
     expect(lines).toContain('Claude · 5h 62% left · week 80% left')
-    expect(lines).toContain(`resets ${resetText(entered + 90 * MIN, true)} · ${resetText(Date.parse(week))}`)
+    expect(lines).toContain(`5h resets ${resetText(entered + 90 * MIN, true)} · week resets ${resetText(Date.parse(week))}`)
     expect(lines).toContain('Codex · week 97% left')
     expect(lines).toContain(`resets ${resetText(limits.weekResetAt)} · typed 30m ago`)
     expect(lines).toContain('≈ 95.8% now (2 plan reviews since × ~0.6%)') // the api and the failed row do not count; the other terminal's do
@@ -3190,6 +3190,8 @@ test('the limits row at the docked width: every line fits 42 cells, the long est
     const row = lines.slice(lines.indexOf('Claude · 5h 62% left · week 80% left'))
     expect(row.length).toBeGreaterThan(5)
     expect(lines).toContain('Codex · week 97% left · 5h 80% left')
+    // the labelled wording is 45 characters: it shortens, with the week's date dropped and the weekday kept
+    expect(lines).toContain(`5h ${resetText(entered + 90 * MIN, true)} · wk ${resetText(entered + 5 * 24 * 60 * MIN).replace(/ \d\d\/\d\d /, ' ')}`)
     expect(lines).toContain('≈ 95.8% now (2 reviews since)') // the full wording is 43 characters
     for (const t of row.slice(0, 7)) expect(t.length).toBeLessThanOrEqual(42)
     await ui.unmount()
@@ -3284,7 +3286,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     // a colour no Claude bucket has, the same on both bars' legend
     const colours = legend.map(r => r.color)
     expect(new Set(colours).size).toBe(colours.length)
-    expect(cx?.color).toBe(surface === 'terminal' ? 'diffRemovedWord' : PALETTES.neutral.codex)
+    expect(cx?.color).toBe(surface === 'terminal' ? CODEX_COLOR : PALETTES.neutral.codex)
     if (surface === 'desktop') {
       const bars = (await ui.findAll({ type: 'Svg' })).filter(x => /^Cost by who|^Tokens written by who/.test(String(x.props.alt)))
       expect(bars).toHaveLength(2)
@@ -3693,4 +3695,124 @@ test('clean keeps a zero-width joiner, so a joined emoji is not split', () => {
   expect(clean('👨‍👩‍👧')).toBe('👨‍👩‍👧')
   expect(clean('a\u200db')).toBe('a\u200db')
   expect(clean('a\u200cb\u200eb')).toBe('a b b')
+})
+
+// -- fix round: colour, paths in skip reasons and labels, reviews not rows, shell forms, compact dollars, labelled resets ----
+test('the Codex terminal colour is a theme key none of the other buckets (nor the grey of "before") use', () => {
+  expect(CODEX_COLOR).toBe('remember')
+  for (const key of [...Object.values(MODEL_COLOR), 'inactive', 'success', 'warning', 'error']) expect(CODEX_COLOR).not.toBe(key)
+  expect(new Set([...Object.values(MODEL_COLOR), CODEX_COLOR]).size).toBe(5)
+  // and the SVG one differs from every SVG bucket colour in every palette
+  for (const pal of Object.values(PALETTES)) expect(Object.values(pal.bucket)).not.toContain(pal.codex)
+})
+
+test('a skip reason keeps only what is before the first colon: "reused:/Users/x/y" stores no path, in the parse and in a stored value', () => {
+  expect(codexSkip('reused:/Users/x/y')).toBe('reused')
+  expect(codexSkip('no_code')).toBe('no_code')
+  expect(codexSkip('plan_limit:a:b')).toBe('plan_limit')
+  expect(codexSkip(':/Users/x')).toBe('')
+  const row = csvRow({ timestamp: at(2), auth: 'none', input_tokens: '', cached_input_tokens: '', output_tokens: '', duration_s: '', skip_reason: 'reused:/Users/x/y' })
+  const out = parseCodex(csvOf(row), 0)
+  expect(out.runs[0]?.skip).toBe('reused')
+  expect(JSON.stringify(out)).not.toContain('/Users/')
+  const fixed = saneCodex({ ...emptyCodex(), runs: [{ label: 'a', at: 1, skip: 'reused:/Users/x/y' }] })
+  expect(fixed.runs[0]?.skip).toBe('reused')
+  expect(JSON.stringify(fixed)).not.toContain('/Users/')
+})
+
+test('a label keeps no e-mail address and no path: in the parse, in a stored value and in a launch, so they still match', () => {
+  expect(codexLabel('/Users/jdoe/src/web-api')).toBe('web-api')
+  expect(codexLabel('~/src/web-api/')).toBe('web-api')
+  expect(codexLabel('dev@example.com')).toBe('…')
+  expect(codexLabel('ping dev@example.com now')).toBe('ping … now')
+  expect(codexLabel('acme/web-api#12')).toBe('acme/web-api#12') // a repo/PR label is not a path
+  const out = parseCodex(csvOf(csvRow({ timestamp: at(2), label: '/Users/jdoe/src/web-api' }), csvRow({ timestamp: at(3), label: 'dev@example.com' })), 0)
+  expect(out.runs.map(r => r.label)).toEqual(['web-api', '…'])
+  expect(JSON.stringify(saneCodex({ ...emptyCodex(), runs: [{ label: '/Users/jdoe/x' }], launches: [{ label: 'dev@example.com', at: 1 }] }))).not.toMatch(/Users|@/)
+  expect(codexLaunchesIn('.claude/bin/codex-review.sh --label /Users/jdoe/src/web-api')).toEqual(['web-api'])
+  expect(parseCodex(csvOf(csvRow({ timestamp: at(2), label: '/Users/jdoe/src/web-api' })), 0, [launch('web-api', 1)]).totals.runs).toBe(1)
+})
+
+test('totals.runs counts reviews, not rows: a failed row followed by an API fallback from the same launch is one; tokens and dollars add up every row', () => {
+  const L = [launch('a#1', 1), launch('b#2', 1)]
+  const plan = (label: string, minutes: number, exit = '0') => csvRow({ timestamp: at(minutes), label, exit_code: exit })
+  const api = (label: string, minutes: number, exit = '0') => csvRow({ timestamp: at(minutes), label, auth: 'api', fell_back: 'yes', exit_code: exit })
+  const count = (...rowsIn: string[]) => parseCodex(csvOf(...rowsIn), 0, L).totals.runs
+  expect(count(plan('a#1', 2))).toBe(1)
+  expect(count(plan('a#1', 2, '3'))).toBe(1) // a failure with no fallback is still a review
+  expect(count(plan('a#1', 2, '3'), api('a#1', 3))).toBe(1)
+  expect(count(plan('a#1', 2, '3'), api('a#1', 3, '3'))).toBe(1) // the fallback failed too: the review is counted once
+  expect(count(plan('a#1', 2), plan('a#1', 3))).toBe(2) // two good runs are two
+  expect(count(plan('a#1', 2, '3'), api('a#1', 3), plan('b#2', 4, '3'), api('b#2', 5))).toBe(2) // two launches, each one review
+  expect(count(plan('a#1', 2, '3'), api('b#2', 3))).toBe(2) // the fallback belongs to ANOTHER launch: both count
+  expect(parseCodex(csvOf(plan('a#1', 2, '3'), api('a#1', 3)), 0).totals.runs).toBe(2) // no launches given (the parser's own mode): no owner, each row counts
+  const both = parseCodex(csvOf(plan('a#1', 2), api('a#1', 3)), 0, L)
+  expect(both.totals.input).toBe(2 * 428_723)
+  expect(close(both.totals.usd, 2 * 0.159)).toBe(true)
+})
+
+test('codexLaunchesIn also reads the shell forms around the script (for / if / while with do, then, else); `bash -n` is a syntax check and not a launch', () => {
+  const run = '.claude/bin/codex-review.sh --repo . --base main --head HEAD'
+  expect(codexLaunchesIn(`for x in a b; do ${run} --label ${'$'}x; done`)).toEqual(['$x']) // the label is read as written; a variable will simply not match a row
+  expect(codexLaunchesIn(`for x in a; do bash ${run} --label x1; done`)).toEqual(['x1'])
+  expect(codexLaunchesIn(`if true; then ${run} --label x2; else ${run} --label x3; fi`)).toEqual(['x2', 'x3'])
+  expect(codexLaunchesIn(`while read l; do ${run} --label x4 < in.txt; done`)).toEqual(['x4'])
+  expect(codexLaunchesIn(`nice -n 5 bash ${run} --label x5`)).toEqual(['x5']) // nice's own -n is not bash's
+  expect(codexLaunchesIn(`bash -n ${run} --label x6`)).toEqual([])
+  expect(codexLaunchesIn(`sh -n ${run} --label x7`)).toEqual([])
+  expect(codexLaunchesIn(`bash -xn ${run} --label x8`)).toEqual([])
+  expect(codexLaunchesIn(`bash -x ${run} --label x9`)).toEqual(['x9'])
+  expect(codexLaunchesIn(`bash -n ${run} --label x10; bash ${run} --label x11`)).toEqual(['x11'])
+  expect(codexLaunchesIn(`for x in a; do echo ${run} --label x12; done`)).toEqual([])
+})
+
+test('usdShort keeps a number whole: $1.2k, $12k, $1.2M, $12M; under 1000 it is the plain price', () => {
+  expect(usdShort(999.5)).toBe('$999.50')
+  expect(usdShort(1000)).toBe('$1.0k')
+  expect(usdShort(1234.56)).toBe('$1.2k')
+  expect(usdShort(12_345)).toBe('$12k')
+  expect(usdShort(1_234_567)).toBe('$1.2M')
+  expect(usdShort(12_345_678)).toBe('$12M')
+})
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`in the narrow tile on ${surface} an amount from $1000 is shortened to $1.2k and never cut inside a number`, async ($, on) => {
+    on('state.get', (_, e) => storedCodex(live({ costUsd: 1234.56 }), withCodex({ totals: { runs: 3, durationS: 600, input: 1_200_000, cached: 900_000, output: 30_000, usd: 2345.67 } }), e))
+    const ui = await $.ui.mount({ ...PANE, surface }) // bodyColumns 44: the tile is 14 cells
+    const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    expect(texts).toContain('$3580.23') // the big number fits whole
+    expect(texts).toContain('Claude $1.2k')
+    expect(texts).toContain('Codex ≈$2.3k')
+    for (const t of texts.filter(x => /^(Claude \$|Codex ≈)/.test(x) || x === '$3580.23')) expect(t.length).toBeLessThanOrEqual(13)
+    expect(texts.join('\n')).not.toMatch(/Claude \$123(?![0-9.])/) // never a number cut short
+    await ui.unmount()
+  })
+
+  test(`in the narrow tile on ${surface} a total in the millions is shortened too, and wide it stays whole`, async ($, on) => {
+    on('state.get', (_, e) => storedCodex(live({ costUsd: 1_234_567_890 }), withCodex({ totals: { runs: 1, durationS: 1, input: 1, cached: 0, output: 1, usd: 2345.67 } }), e))
+    const narrow = await $.ui.mount({ ...PANE, surface })
+    const texts = (await narrow.findAll({ type: 'Text' })).map(t => t.text)
+    expect(texts).toContain('$1235M') // 1234570235.67 -> 14 characters whole, 6 short
+    expect(texts).toContain('Claude $1235M')
+    await narrow.unmount()
+    const wide = await $.ui.mount({ ...PANE, surface, props: WIDE })
+    const full = (await wide.findAll({ type: 'Text' })).map(t => t.text)
+    expect(full).toContain('$1234570235.67')
+    expect(full).toContain('Claude $1234567890.00')
+    await wide.unmount()
+  })
+}
+
+test('claudeLimitLines labels the reset times, and shortens them where they do not fit', () => {
+  const five = Date.parse('2026-11-09T14:00:00')
+  const week = Date.parse('2026-11-15T12:20:00')
+  const windows = [
+    { kind: 'five_hour' as const, leftPct: 62, resetsAt: five },
+    { kind: 'seven_day' as const, leftPct: 80, resetsAt: week },
+  ]
+  expect(claudeLimitLines(windows)?.resets).toBe('5h resets 14:00 · week resets Sun 15/11 12:20')
+  expect(claudeLimitLines(windows, 40)?.resets).toBe('5h 14:00 · wk Sun 12:20')
+  expect(claudeLimitLines([windows[0] as (typeof windows)[number]], 40)?.resets).toBe('5h resets 14:00')
+  expect(claudeLimitLines([windows[1] as (typeof windows)[number]], 40)?.resets).toBe('week resets Sun 15/11 12:20')
+  expect(claudeLimitLines([{ kind: 'five_hour', leftPct: 62, resetsAt: null }])?.resets).toBe('')
 })

@@ -78,14 +78,21 @@ const BAD: Color = 'error'
 const MARK: Color = 'text' // contrasts with every zone colour and the track
 const GREY: Color = 'inactive' // the cost nobody booked to a bucket
 
-const MODEL_COLOR: Record<MeterBucket, Color> = {
+export const MODEL_COLOR: Record<MeterBucket, Color> = {
   'opus-main': 'claude',
   haiku: 'planMode', // teal
   sonnet: 'ide', // blue
   'opus-checks': 'merged', // purple: Opus again, told apart from main
 }
 // Codex (GPT) is a bucket of its own in the pane, but not a MeterBucket: it is not Claude spend and is not in `MeterData`.
-const CODEX_COLOR: Color = 'diffRemovedWord' // rose in the dark and light themes; the SVG charts use `palette.codex`
+// Theme key chosen against the four Claude keys above in every theme the engine ships (values read from the
+// installed Claude Code 2.1.x build): `remember` is blue (0,0,255) in light, lavender (177,185,249) in dark,
+// blue (51,102,255) in light-daltonized, light blue (153,204,255) in dark-daltonized, ansi:blue in light-ansi and
+// ansi:blueBright in dark-ansi. Never equal to claude / planMode / ide / merged / inactive in any of them, but in dark
+// it is the closest to merged (purple (175,135,255)) and in the daltonized themes near ide: no theme key is clear of
+// all four everywhere (diffRemovedWord and error equal `claude` in the ansi themes; autoAccept and bashBorder equal
+// `merged`; warning equals claude's orange in light-daltonized). The SVG charts use `palette.codex` (rose) instead.
+export const CODEX_COLOR: Color = 'remember'
 const CODEX_NAME = 'Codex (GPT)'
 const BUCKETS: MeterBucket[] = ['opus-main', 'haiku', 'sonnet', 'opus-checks']
 const BUCKET_LABEL: Record<MeterBucket, string> = {
@@ -103,6 +110,9 @@ type Dollar = EngineInterface
 
 // -- formatting -------------------------------------------------------------
 const usd = (n: number) => `$${n.toFixed(2)}`
+/** Dollars in as few characters as keep the number whole: `$1.2k`, `$12k`, `$1.2M`; under 1000 as `usd`. */
+export const usdShort = (n: number): string =>
+  n >= 1_000_000 ? `$${n >= 10_000_000 ? Math.round(n / 1_000_000) : (n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `$${n >= 10_000 ? Math.round(n / 1000) : (n / 1000).toFixed(1)}k` : usd(n)
 // Under 1k as is; k with no decimals; 1.1M style at and over a million.
 export const tokens = (n: number) => (n >= 999_500 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(Math.round(n)))
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
@@ -560,6 +570,19 @@ export function parseCsv(text: string): string[][] {
 
 /** `codex-review.sh` puts a `'` in front of a field that starts with `= + @ - TAB`; take it off again. */
 const unguard = (v: string): string => (v.length > 1 && v.startsWith("'") && '=+@-\t'.includes(v.charAt(1)) ? v.slice(1) : v)
+/**
+ * A label as it is stored, drawn and matched: an e-mail address becomes `…`, a path (`/Users/x/repo`, `~/repo`)
+ * keeps only its last part, control characters go, 40 characters at most. Launch labels and log labels go through
+ * this alike, so they still match.
+ */
+export const codexLabel = (raw: string): string => {
+  const noMail = raw.replace(/\S+@\S+/g, '…').trim()
+  const last = /^[/~]/.test(noMail) ? (noMail.split('/').filter(x => x !== '').pop() ?? '') : noMail
+
+  return agentName(last)
+}
+/** A skip reason as stored: the script writes `reused:<folder>`, so only what is before the first `:` is kept. */
+export const codexSkip = (raw: string): string => truncate(clean(raw.split(':')[0] ?? '').trim(), 24)
 /** A count from the log: digits only, at most 12 of them; anything else is 0. */
 const codexNum = (v: string): number => (/^[0-9]{1,12}(?:\.[0-9]+)?$/.test(v.trim()) ? Math.round(Number(v)) : 0)
 
@@ -578,10 +601,15 @@ export const codexCost = (input: number, cached: number, output: number): number
  * launch of the same label takes over from the first), and the row must come within two hours of it.
  */
 export function claimed(launches: CodexLaunch[], label: string, at: number): boolean {
+  return claimOwner(launches, label, at) >= 0
+}
+
+/** The time of the launch that claims the row, or -1 when none does. */
+function claimOwner(launches: CodexLaunch[], label: string, at: number): number {
   let from = -1
   for (const l of launches) if (l.label === label && l.at <= at && l.at > from) from = l.at
 
-  return from >= 0 && at < from + CLAIM_WINDOW_MS
+  return from >= 0 && at < from + CLAIM_WINDOW_MS ? from : -1
 }
 
 /**
@@ -612,6 +640,7 @@ export function parseCodex(text: string, startedAt: number, launches?: CodexLaun
     .slice(-MAX_CODEX_LINES)
 
   const runs: CodexRun[] = []
+  const owners: string[] = [] // per row: the launch that claimed it, '' with no attribution
   const totals = { ...EMPTY_CODEX.totals }
   const planDoneAt: number[] = []
   for (const r of records) {
@@ -627,11 +656,13 @@ export function parseCodex(text: string, startedAt: number, launches?: CodexLaun
     if (!Number.isFinite(at) || auth === undefined) continue
     const exit = get('exit_code')
     const exitCode = /^[0-9]{1,4}$/.test(exit) ? Number(exit) : null
-    const skip = truncate(clean(get('skip_reason')), 24)
+    const skip = codexSkip(get('skip_reason'))
     if (auth === 'plan' && exitCode === 0 && skip === '' && planDoneAt.length < MAX_CODEX_PLAN) planDoneAt.push(at)
     if (at < startedAt) continue
-    const label = agentName(get('label')) || 'review'
-    if (launches !== undefined && !claimed(launches, label, at)) continue
+    const label = codexLabel(get('label')) || 'review'
+    const from = launches === undefined ? -1 : claimOwner(launches, label, at)
+    if (launches !== undefined && from < 0) continue
+    const owner = from < 0 ? '' : `${label}\u0000${from}` // which launch: its label and its time
     const run: CodexRun = {
       label,
       at,
@@ -645,8 +676,8 @@ export function parseCodex(text: string, startedAt: number, launches?: CodexLaun
       skip,
     }
     runs.push(run)
+    owners.push(owner)
     if (skip === '') {
-      totals.runs++
       totals.durationS += run.durationS
       totals.input += run.input
       totals.cached += run.cached
@@ -654,6 +685,10 @@ export function parseCodex(text: string, startedAt: number, launches?: CodexLaun
       totals.usd += codexCost(run.input, run.cached, run.output)
     }
   }
+
+  // `totals.runs` counts reviews, not rows: a run that failed and was followed by an API fallback row from the
+  // same launch is one review. Tokens and dollars above still add up every row.
+  totals.runs = runs.filter((r, i) => r.skip === '' && !(r.exitCode !== 0 && (owners[i] ?? '') !== '' && runs.some((n, j) => j > i && owners[j] === owners[i] && n.auth === 'api' && n.skip === ''))).length
 
   return { runs: runs.slice(-MAX_CODEX_RUNS), totals, planDoneAt, launches: mine, tooBig: false }
 }
@@ -671,7 +706,7 @@ export function saneCodex(raw: unknown): MeterCodex {
     typeof x.label === 'string'
       ? [
           {
-            label: agentName(x.label) || 'review',
+            label: codexLabel(x.label) || 'review',
             at: count(x.at),
             durationS: count(x.durationS),
             input: count(x.input),
@@ -680,7 +715,7 @@ export function saneCodex(raw: unknown): MeterCodex {
             auth: pick(x.auth, CODEX_AUTH, 'none'),
             fellBack: x.fellBack === true,
             exitCode: finOrNull(x.exitCode),
-            skip: truncate(clean(strOr(x.skip)), 24),
+            skip: codexSkip(strOr(x.skip)),
           },
         ]
       : [],
@@ -692,7 +727,7 @@ export function saneCodex(raw: unknown): MeterCodex {
     tooBig: r.tooBig === true,
     launches: rows(r.launches)
       .flatMap((x): CodexLaunch[] => {
-        const label = typeof x.label === 'string' ? agentName(x.label) : ''
+        const label = typeof x.label === 'string' ? codexLabel(x.label) : ''
         const at = fin(x.at, -1)
 
         return label !== '' && at >= 0 ? [{ label, at }] : []
@@ -824,8 +859,12 @@ export function shellSegments(command: string): string[][] {
 
 // What may stand in front of `codex-review.sh` in a command that really runs it: a shell, a wrapper, a
 // `NAME=value`, a flag or a duration. `echo codex-review.sh ...` or `grep codex-review.sh` is not a launch.
-const LAUNCH_PREFIX = new Set(['bash', 'sh', 'zsh', 'nohup', 'time', 'exec', 'command', 'env', 'timeout', 'setsid', 'caffeinate', 'nice', '(', '{', '!'])
+// (`for x in a; do script`, `if c; then script`: the `;` cuts the command, so `do` / `then` / `else` start the next one.)
+const LAUNCH_PREFIX = new Set(['bash', 'sh', 'zsh', 'nohup', 'time', 'exec', 'command', 'env', 'timeout', 'setsid', 'caffeinate', 'nice', '(', '{', '!', 'do', 'then', 'else', 'elif'])
+const SHELLS = new Set(['bash', 'sh', 'zsh'])
 const isLaunchPrefix = (w: string): boolean => LAUNCH_PREFIX.has(w) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || /^-/.test(w) || /^[0-9]+[smhd]?$/.test(w)
+/** `bash -n script` (and `-xn`...) only checks the syntax: the script does not run. */
+const isSyntaxCheck = (before: string[]): boolean => before.some((w, i) => SHELLS.has(w) && before.slice(i + 1).some(f => /^-[a-zA-Z]*n[a-zA-Z]*$/.test(f)))
 
 /**
  * The labels of the reviews a Bash command starts: each `codex-review.sh ... --label <x>` (bare, '…' or "…",
@@ -836,7 +875,7 @@ export function codexLaunchesIn(command: string): string[] {
   const labels: string[] = []
   for (const words of shellSegments(command)) {
     const at = words.findIndex(w => w === 'codex-review.sh' || w.endsWith('/codex-review.sh'))
-    if (at < 0 || !words.slice(0, at).every(isLaunchPrefix)) continue
+    if (at < 0 || !words.slice(0, at).every(isLaunchPrefix) || isSyntaxCheck(words.slice(0, at))) continue
     const args = words.slice(at + 1)
     if (args.includes('--classify')) continue
     let label: string | undefined
@@ -845,7 +884,7 @@ export function codexLaunchesIn(command: string): string[] {
       if (a === '--label') label = args[i + 1]
       else if (a.startsWith('--label=')) label = a.slice('--label='.length)
     }
-    const name = agentName((label ?? '').trim())
+    const name = codexLabel((label ?? '').trim())
     if (name !== '') labels.push(name)
   }
 
@@ -1814,12 +1853,15 @@ async function readClaudeWindows($: Dollar, now: number): Promise<ClaudeWindow[]
 }
 
 /** The Claude half of the limits row: `Claude · 5h 62% left · week 80% left` and, muted, when each resets. */
-export function claudeLimitLines(windows: ClaudeWindow[]): { main: string; resets: string } | undefined {
+export function claudeLimitLines(windows: ClaudeWindow[], room = Number.POSITIVE_INFINITY): { main: string; resets: string } | undefined {
   if (windows.length === 0) return undefined
   const names = { five_hour: '5h', seven_day: 'week' } as const
-  const resets = windows.flatMap(w => (w.resetsAt === null ? [] : [resetText(w.resetsAt, w.kind === 'five_hour')]))
+  const dated = windows.flatMap(w => (w.resetsAt === null ? [] : [{ kind: w.kind, at: w.resetsAt }]))
+  // `5h resets 14:00 · week resets Sun 15/11 12:20`; where that does not fit, `5h 14:00 · wk Sun 12:20`.
+  const full = dated.map(w => `${names[w.kind]} resets ${resetText(w.at, w.kind === 'five_hour')}`).join(' · ')
+  const short = dated.map(w => (w.kind === 'five_hour' ? `5h ${resetText(w.at, true)}` : `wk ${resetText(w.at).replace(/ \d\d\/\d\d /, ' ')}`)).join(' · ')
 
-  return { main: `Claude · ${windows.map(w => `${names[w.kind]} ${pctText(w.leftPct)}% left`).join(' · ')}`, resets: resets.length === 0 ? '' : `resets ${resets.join(' · ')}` }
+  return { main: `Claude · ${windows.map(w => `${names[w.kind]} ${pctText(w.leftPct)}% left`).join(' · ')}`, resets: full.length <= room ? full : short }
 }
 
 /**
@@ -1830,7 +1872,7 @@ export function claudeLimitLines(windows: ClaudeWindow[]): { main: string; reset
 function limitsRow(k: Kit, l: Layout, windows: ClaudeWindow[], limits: CodexLimits | undefined, codex: MeterCodex, now: number): RenderElement | null {
   const { Box, Text, Link } = k
   const room = Math.max(8, l.width - 2)
-  const claude = claudeLimitLines(windows)
+  const claude = claudeLimitLines(windows, room)
   const ran = codex.totals.runs > 0
   const typed = limits !== undefined
   if (claude === undefined && !typed && !ran && !codex.tooBig) return null
@@ -1896,15 +1938,17 @@ function topSection(k: Kit, l: Layout, d: MeterData, codex: MeterCodex, windows:
   // With Codex in the session the tile is the TOTAL, Claude's part and Codex's below it (the Codex one is
   // an API-equivalent price, not a bill: the longer wording only where the tile has the room).
   const ranCodex = codex.totals.runs > 0
-  const fits = (text: string): string => (side && text.length > tileW - 1 ? '' : text)
+  // The first wording that fits the tile, longest first; a number is never cut: it becomes `$1.2k` before it is.
+  const room = side ? tileW - 1 : Number.POSITIVE_INFINITY
+  const pickFit = (...options: string[]): string => options.find(o => o.length <= room) ?? options[options.length - 1] ?? ''
   const costTile = ranCodex
     ? tile(
         'Session cost',
-        big(k, usd(d.costUsd + codex.totals.usd)),
-        caption(k, `Claude ${usd(d.costUsd)}`, true),
-        caption(k, fits(`Codex ≈${usd(codex.totals.usd)} API-eq`) || `Codex ≈${usd(codex.totals.usd)}`, true),
+        big(k, pickFit(usd(d.costUsd + codex.totals.usd), usdShort(d.costUsd + codex.totals.usd))),
+        caption(k, pickFit(`Claude ${usd(d.costUsd)}`, `Claude ${usdShort(d.costUsd)}`, usdShort(d.costUsd))),
+        caption(k, pickFit(`Codex ≈${usd(codex.totals.usd)} API-eq`, `Codex ≈${usd(codex.totals.usd)}`, `Codex ≈${usdShort(codex.totals.usd)}`, `≈${usdShort(codex.totals.usd)}`)),
       )
-    : tile('Session cost', big(k, usd(d.costUsd)), caption(k, 'list price'))
+    : tile('Session cost', big(k, pickFit(usd(d.costUsd), usdShort(d.costUsd))), caption(k, 'list price'))
   const tiles = [
     costTile,
     tile('Context', big(k, tokens(d.contextTokens), contextZone(d.contextTokens)), caption(k, 'read each call')),
