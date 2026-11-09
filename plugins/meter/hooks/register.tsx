@@ -1,15 +1,16 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, Elements, EngineInterface, Register, RenderElement, Timer } from 'claude-code'
 
-import type { CodexLimits, CodexRun, MeterAgent, MeterBucket, MeterCodex, MeterData, MeterGroup, MeterPr, MeterPrFetch, MeterPrKind } from '../types'
+import type { CodexLaunch, CodexLimits, CodexRun, MeterAgent, MeterBucket, MeterCodex, MeterData, MeterGroup, MeterPr, MeterPrFetch, MeterPrKind } from '../types'
 
 // ---------------------------------------------------------------------------
 // ZERO MODEL TOKENS. This mod never asks a model anything, never adds a tool,
 // never touches a prompt and never rewrites a tool result. It reads numbers
 // the engine already reports (cost, context, usage, agent ids) and draws them.
 // The one thing it reads out of text is GitHub PR URLs in a Bash command and
-// its result (see `prUrlsIn`), and the word `codex-review` in a Bash command; nothing
-// else from prompts or outputs. The one file it reads is the Codex CSV (see below).
+// its result (see `prUrlsIn`), and, in a Bash command that runs `codex-review.sh`, the
+// `--label` word (see `codexLaunchesIn`); nothing else from prompts or outputs. The one
+// file it reads is the Codex CSV (see below).
 // ---------------------------------------------------------------------------
 
 const PANE = 'meter'
@@ -47,11 +48,12 @@ const data = atom({ plugin: 'meter', key: 'data' } as const, EMPTY, { shape: 'me
 const EMPTY_CI: MeterPr[] = []
 const ciAtom = atom({ plugin: 'meter', key: 'ci' } as const, EMPTY_CI, { shape: 'ci-1' })
 
-// The Codex runs on this machine since this session started, read from the one local log `codex-review.sh`
-// writes (see the Codex block below). Its own atom and tag, so a bump of `data`
-// or `ci` never wipes it. Bump `codex-1` only when MeterCodex itself changes.
-const EMPTY_CODEX: MeterCodex = { runs: [], totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [], tooBig: false }
-const codexAtom = atom({ plugin: 'meter', key: 'codex' } as const, EMPTY_CODEX, { shape: 'codex-1' })
+// The Codex runs THIS session launched, read from the one local log `codex-review.sh`
+// writes (see the Codex block below), plus the launches themselves. Its own atom and tag, so a bump of `data`
+// or `ci` never wipes it. Bump `codex-2` only when MeterCodex itself changes (codex-1 held every row on the
+// machine and no launches: it is declined, and `saneCodex` empties one that gets through).
+const EMPTY_CODEX: MeterCodex = { runs: [], totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [], launches: [], tooBig: false }
+const codexAtom = atom({ plugin: 'meter', key: 'codex' } as const, EMPTY_CODEX, { shape: 'codex-2' })
 
 const MAX_GROUPS = 12 // columns of the Dollars chart, step 1 alone included
 const MAX_AGENTS = 60
@@ -82,6 +84,9 @@ const MODEL_COLOR: Record<MeterBucket, Color> = {
   sonnet: 'ide', // blue
   'opus-checks': 'merged', // purple: Opus again, told apart from main
 }
+// Codex (GPT) is a bucket of its own in the pane, but not a MeterBucket: it is not Claude spend and is not in `MeterData`.
+const CODEX_COLOR: Color = 'diffRemovedWord' // rose in the dark and light themes; the SVG charts use `palette.codex`
+const CODEX_NAME = 'Codex (GPT)'
 const BUCKETS: MeterBucket[] = ['opus-main', 'haiku', 'sonnet', 'opus-checks']
 const BUCKET_LABEL: Record<MeterBucket, string> = {
   'opus-main': 'Opus (main)',
@@ -190,9 +195,10 @@ export function summary(d: MeterData, ci: MeterPr[], codex: MeterCodex = EMPTY_C
   const agents = d.agents.length > 0 ? ` · ${d.agents.length} agent${d.agents.length === 1 ? '' : 's'}` : ''
   const prs = ci.length > 0 ? ` · CI: ${ci.length} PR${ci.length === 1 ? '' : 's'}, ${ciWorst(ci)}` : ''
 
-  const cx = codex.totals.runs > 0 ? ` · Codex ${codex.totals.runs} run${codex.totals.runs === 1 ? '' : 's'} ≈${usd(codex.totals.usd)} API-eq` : ''
+  // The session total is Claude + Codex; Codex is an API-equivalent price (nothing was billed on a plan run).
+  const session = codex.totals.runs > 0 ? `${usd(d.costUsd + codex.totals.usd)} (Claude ${usd(d.costUsd)} + Codex ≈${usd(codex.totals.usd)} API-eq)` : usd(d.costUsd)
 
-  return `Session ${usd(d.costUsd)} · context ${tokens(d.contextTokens)} · ${cache}${agents}${prs}${cx}`
+  return `Session ${session} · context ${tokens(d.contextTokens)} · ${cache}${agents}${prs}`
 }
 
 // ---------------------------------------------------------------------------
@@ -495,8 +501,12 @@ async function commitCi($: Dollar, change: (ci: MeterPr[]) => MeterPr[]): Promis
 }
 
 // ---------------------------------------------------------------------------
-// Codex: the `codex-review.sh` runs on this machine since this session started, read from ONE local
-// log (it has no session column, so a run from another terminal counts too).
+// Codex: the `codex-review.sh` runs THIS session launched, read from ONE local log. The log has no
+// session column, so a run counts only when this session launched it: a Bash call that runs
+// `codex-review.sh` (not `--classify`) leaves a launch (its `--label` and the time), and a row is
+// claimed by the latest launch of the same label made at or before the row's timestamp, for at most
+// two hours. Rows nobody claimed belong to another terminal and are ignored. (Limit: another session
+// reviewing the SAME label at the same time can be claimed twice.)
 //
 // The ONLY file this mod reads is `${HOME}/.amiqa/codex-review-runs.csv` (a
 // constant; no input ever builds a path). It never reads `~/.codex`, never starts
@@ -512,6 +522,9 @@ export const CODEX_USAGE_URL = 'https://chatgpt.com/settings/usage'
 const MAX_CODEX_RUNS = 8 // rows drawn; the totals count every row read
 const MAX_CODEX_LINES = 500 // the log's last lines looked at
 const MAX_CODEX_PLAN = 500
+const MAX_LAUNCHES = 100
+const CLAIM_WINDOW_MS = 2 * 60 * 60 * 1000 // a launch claims rows for this long, if no later launch of the same label takes over
+const MAX_COMMAND_CHARS = 20_000 // a Bash command is read no further than this for a launch
 const CODEX_AUTH = ['plan', 'api', 'none'] as const
 
 /** One RFC-4180 parser: quotes, `""`, commas and line breaks inside quotes, CRLF. Blank lines come back as `['']`. */
@@ -561,13 +574,28 @@ export const codexCost = (input: number, cached: number, output: number): number
 }
 
 /**
- * The CSV's text as the Codex runs on this machine since `startedAt`. Columns are found by their HEADER NAME,
- * so a new column never moves anything; the last 500 records at most; a row that is short, garbled or before
- * `startedAt` is skipped (the plan-run times, kept for the limit estimate, ignore `startedAt`).
+ * True when a launch of this `label` made at or before `at` claims the row: the LATEST such launch (so a second
+ * launch of the same label takes over from the first), and the row must come within two hours of it.
  */
-export function parseCodex(text: string, startedAt: number): MeterCodex {
+export function claimed(launches: CodexLaunch[], label: string, at: number): boolean {
+  let from = -1
+  for (const l of launches) if (l.label === label && l.at <= at && l.at > from) from = l.at
+
+  return from >= 0 && at < from + CLAIM_WINDOW_MS
+}
+
+/**
+ * The CSV's text as the Codex runs THIS session launched, since `startedAt`: a row counts when `claimed`
+ * by one of `launches`. `launches` left out means no attribution (every row since `startedAt`); the mod
+ * itself always passes the session's. Columns are found by their HEADER NAME, so a new column never moves
+ * anything; the last 500 records at most; a row that is short, garbled, before `startedAt` or unclaimed is
+ * skipped (the plan-run times, kept for the limit estimate, ignore both: that limit is account-wide).
+ */
+export function parseCodex(text: string, startedAt: number, launches?: CodexLaunch[]): MeterCodex {
+  const mine = launches ?? []
+  const empty: MeterCodex = { ...EMPTY_CODEX, launches: mine }
   const firstBreak = text.indexOf('\n')
-  if (firstBreak < 0) return EMPTY_CODEX
+  if (firstBreak < 0) return empty
   const header = parseCsv(text.slice(0, firstBreak).replace(/^\uFEFF/, ''))[0] ?? []
   const col = new Map<string, number>()
   header.forEach((h, i) => {
@@ -575,7 +603,7 @@ export function parseCodex(text: string, startedAt: number): MeterCodex {
     if (!col.has(name)) col.set(name, i)
   })
   const idx = (name: string): number => col.get(name) ?? -1
-  if (idx('timestamp') < 0 || idx('auth') < 0 || idx('label') < 0) return EMPTY_CODEX
+  if (idx('timestamp') < 0 || idx('auth') < 0 || idx('label') < 0) return empty
   const need = Math.max(...['timestamp', 'label', 'auth', 'fell_back', 'duration_s', 'exit_code', 'input_tokens', 'cached_input_tokens', 'output_tokens'].map(idx)) + 1
   // Whole text first, then the last 500 RECORDS: a cut in the middle of a quoted field (a label ending in a
   // line break) would otherwise swallow every row after it. The file is at most 4 MiB.
@@ -602,8 +630,10 @@ export function parseCodex(text: string, startedAt: number): MeterCodex {
     const skip = truncate(clean(get('skip_reason')), 24)
     if (auth === 'plan' && exitCode === 0 && skip === '' && planDoneAt.length < MAX_CODEX_PLAN) planDoneAt.push(at)
     if (at < startedAt) continue
+    const label = agentName(get('label')) || 'review'
+    if (launches !== undefined && !claimed(launches, label, at)) continue
     const run: CodexRun = {
-      label: agentName(get('label')) || 'review',
+      label,
       at,
       durationS: codexNum(get('duration_s')),
       input: codexNum(get('input_tokens')),
@@ -625,12 +655,16 @@ export function parseCodex(text: string, startedAt: number): MeterCodex {
     }
   }
 
-  return { runs: runs.slice(-MAX_CODEX_RUNS), totals, planDoneAt, tooBig: false }
+  return { runs: runs.slice(-MAX_CODEX_RUNS), totals, planDoneAt, launches: mine, tooBig: false }
 }
 
-/** The stored Codex value, repaired: a bad row dropped, every number finite and not negative, the label cleaned again. */
+/**
+ * The stored Codex value, repaired: a bad row dropped, every number finite and not negative, the label cleaned again.
+ * A value without a `launches` list is a `codex-1` one (every row on the machine, none of them attributed): empty.
+ */
 export function saneCodex(raw: unknown): MeterCodex {
   const r = isRec(raw) ? raw : {}
+  if (!Array.isArray(r.launches)) return EMPTY_CODEX
   const t = isRec(r.totals) ? r.totals : {}
   const count = (v: unknown): number => Math.max(0, fin(v, 0))
   const runs = rows(r.runs).flatMap((x): CodexRun[] =>
@@ -656,6 +690,14 @@ export function saneCodex(raw: unknown): MeterCodex {
     runs: runs.slice(-MAX_CODEX_RUNS),
     totals: { runs: count(t.runs), durationS: count(t.durationS), input: count(t.input), cached: count(t.cached), output: count(t.output), usd: count(t.usd) },
     tooBig: r.tooBig === true,
+    launches: rows(r.launches)
+      .flatMap((x): CodexLaunch[] => {
+        const label = typeof x.label === 'string' ? agentName(x.label) : ''
+        const at = fin(x.at, -1)
+
+        return label !== '' && at >= 0 ? [{ label, at }] : []
+      })
+      .slice(-MAX_LAUNCHES),
     planDoneAt: (Array.isArray(r.planDoneAt) ? r.planDoneAt : []).filter((n): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0).slice(-MAX_CODEX_PLAN),
   }
 }
@@ -665,7 +707,8 @@ async function readCodex($: Dollar): Promise<MeterCodex> {
 }
 
 // -- reading the file: only when it changed, only this path -------------------
-let codexKey = '' // `${mtimeMs}:${size}:${startedAt}` of the last look
+let codexKey = '' // `${mtimeMs}:${size}:${startedAt}:${launchEpoch}` of the last look
+let launchEpoch = 0 // counts the launches noted since the module loaded: a new one asks for a fresh parse
 let codexBusy = false
 let codexPending = false // a refresh was asked for while one ran: one more follows
 let codexLastReadAt = 0
@@ -696,12 +739,12 @@ async function refreshCodex($: Dollar): Promise<void> {
       const key = `missing:${startedAt}`
       if (key !== codexKey) {
         codexKey = key
-        await update($, codexAtom, () => EMPTY_CODEX)
+        await update($, codexAtom, c => ({ ...EMPTY_CODEX, launches: saneCodex(c).launches })) // the launches outlive the file
       }
 
       return
     }
-    const key = `${stat.mtimeMs}:${stat.size}:${startedAt}`
+    const key = `${stat.mtimeMs}:${stat.size}:${startedAt}:${launchEpoch}`
     if (key === codexKey) return
     codexKey = key // also when the read below fails: no new read until the file changes
     if (stat.size > MAX_CODEX_BYTES) {
@@ -709,8 +752,9 @@ async function refreshCodex($: Dollar): Promise<void> {
 
       return
     }
-    const parsed = parseCodex(await $.fs.read(path), startedAt)
-    await update($, codexAtom, () => parsed)
+    const text = await $.fs.read(path)
+    // Parsed inside the write, so a launch noted while the file was being read is in the claim.
+    await update($, codexAtom, c => parseCodex(text, startedAt, saneCodex(c).launches))
   } catch {
     // reading is a courtesy; a failed read leaves what the pane has
   } finally {
@@ -720,6 +764,120 @@ async function refreshCodex($: Dollar): Promise<void> {
       void refreshCodex($)
     }
   }
+}
+
+// -- launches: which reviews this session started ------------------------------
+/**
+ * The words of a shell command with the quotes taken off ('…', "…", a backslash), cut into simple commands at
+ * `;` `&` `|` and line breaks. Only a reader for `codexLaunchesIn`: nothing is run, expanded or stored.
+ */
+export function shellSegments(command: string): string[][] {
+  const text = command.slice(0, MAX_COMMAND_CHARS)
+  const out: string[][] = []
+  let words: string[] = []
+  let word = ''
+  let inWord = false
+  let quote = ''
+  const endWord = (): void => {
+    if (inWord) words.push(word)
+    word = ''
+    inWord = false
+  }
+  const endCommand = (): void => {
+    endWord()
+    if (words.length > 0) out.push(words)
+    words = []
+  }
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charAt(i)
+    const next = text.charAt(i + 1)
+    if (quote === "'") {
+      if (c === "'") quote = ''
+      else word += c
+    } else if (quote === '"') {
+      if (c === '"') quote = ''
+      else if (c === '\\' && '"\\$`'.includes(next) && next !== '') {
+        word += next
+        i++
+      } else word += c
+    } else if (c === "'" || c === '"') {
+      quote = c
+      inWord = true
+    } else if (c === '\\') {
+      if (next === '\n') i++ // a line continuation
+      else if (next !== '') {
+        word += next
+        inWord = true
+        i++
+      }
+    } else if (c === ' ' || c === '\t') endWord()
+    else if (c === ';' || c === '&' || c === '|' || c === '\n' || c === '\r') endCommand()
+    else {
+      word += c
+      inWord = true
+    }
+  }
+  endCommand()
+
+  return out
+}
+
+// What may stand in front of `codex-review.sh` in a command that really runs it: a shell, a wrapper, a
+// `NAME=value`, a flag or a duration. `echo codex-review.sh ...` or `grep codex-review.sh` is not a launch.
+const LAUNCH_PREFIX = new Set(['bash', 'sh', 'zsh', 'nohup', 'time', 'exec', 'command', 'env', 'timeout', 'setsid', 'caffeinate', 'nice', '(', '{', '!'])
+const isLaunchPrefix = (w: string): boolean => LAUNCH_PREFIX.has(w) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || /^-/.test(w) || /^[0-9]+[smhd]?$/.test(w)
+
+/**
+ * The labels of the reviews a Bash command starts: each `codex-review.sh ... --label <x>` (bare, '…' or "…",
+ * or `--label=<x>`) that is not a `--classify` call, as the log would write them. A launch with no label
+ * (the script then names it after the repository folder, which is not read here) is not counted.
+ */
+export function codexLaunchesIn(command: string): string[] {
+  const labels: string[] = []
+  for (const words of shellSegments(command)) {
+    const at = words.findIndex(w => w === 'codex-review.sh' || w.endsWith('/codex-review.sh'))
+    if (at < 0 || !words.slice(0, at).every(isLaunchPrefix)) continue
+    const args = words.slice(at + 1)
+    if (args.includes('--classify')) continue
+    let label: string | undefined
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i] ?? ''
+      if (a === '--label') label = args[i + 1]
+      else if (a.startsWith('--label=')) label = a.slice('--label='.length)
+    }
+    const name = agentName((label ?? '').trim())
+    if (name !== '') labels.push(name)
+  }
+
+  return labels
+}
+
+/** Notes the launches of a Bash command, stamped with the second it started. Returns what it noted. */
+async function noteCodexLaunches($: Dollar, command: string): Promise<CodexLaunch[]> {
+  const labels = codexLaunchesIn(command)
+  if (labels.length === 0) return []
+  const now = await readNow($)
+  if (!(now > 0)) return []
+  const at = Math.floor(now / 1000) * 1000 // the log's timestamps are whole seconds
+  const added = labels.map((label): CodexLaunch => ({ label, at }))
+  await update($, codexAtom, c => {
+    const s = saneCodex(c)
+
+    return { ...s, launches: [...s.launches, ...added].slice(-MAX_LAUNCHES) }
+  })
+  launchEpoch++
+
+  return added
+}
+
+/** Takes launches back out: the command was denied, so it never ran. */
+async function forgetCodexLaunches($: Dollar, gone: CodexLaunch[]): Promise<void> {
+  await update($, codexAtom, c => {
+    const s = saneCodex(c)
+
+    return { ...s, launches: s.launches.filter(l => !gone.some(g => g.label === l.label && g.at === l.at)) }
+  })
+  launchEpoch++
 }
 
 // -- the plan limit, typed in by hand ------------------------------------------
@@ -1194,6 +1352,8 @@ export type Palette = {
   warn: string
   bad: string
   bucket: Record<MeterBucket, string>
+  /** The Codex (GPT) bucket: its own colour, none of the four Claude ones. */
+  codex: string
   before: string
 }
 
@@ -1207,6 +1367,7 @@ const TONES = {
   warn: '#DDA65A',
   bad: '#B0412E',
   bucket: { 'opus-main': '#D97757', sonnet: '#3B82D6', haiku: '#55A06A', 'opus-checks': '#9B7BD4' },
+  codex: '#D4608C', // rose: apart from orange, blue, green, purple and the grey of "before"
   before: '#9CA3AF',
 } as const
 
@@ -1510,11 +1671,11 @@ const big = (k: Kit, text: string, color?: Color) => {
   )
 }
 
-const caption = (k: Kit, text: string) => {
+const caption = (k: Kit, text: string, cut = false) => {
   const { Text } = k
 
   return (
-    <Text size="caption" dimColor>
+    <Text size="caption" dimColor wrap={cut ? 'truncate-end' : undefined}>
       {text}
     </Text>
   )
@@ -1624,7 +1785,102 @@ function cacheTile(k: Kit, l: Layout, d: MeterData): RenderElement[] {
   ].flatMap(x => (x === null ? [] : [x]))
 }
 
-function topSection(k: Kit, l: Layout, d: MeterData): RenderElement {
+// -- 1b. Limits: what is left of the Claude windows and of the Codex plan ------
+/** One Claude rate-limit window the engine reported: percent LEFT and when it resets (ms), null when it did not say or it is past. */
+export type ClaudeWindow = { kind: 'five_hour' | 'seven_day'; leftPct: number; resetsAt: number | null }
+
+/**
+ * The engine's rate-limit windows as the row draws them: only `five_hour` and `seven_day`, the first of each,
+ * a percent that is a finite number, and a reset time that parses and is still ahead. Anything else is left out.
+ */
+export function claudeWindows(raw: unknown, now: number): ClaudeWindow[] {
+  const out: ClaudeWindow[] = []
+  for (const kind of ['five_hour', 'seven_day'] as const) {
+    const w = rows(raw).find(x => x.kind === kind && typeof x.percentUsed === 'number' && Number.isFinite(x.percentUsed))
+    if (w === undefined) continue
+    const when = typeof w.resetsAt === 'string' ? Date.parse(w.resetsAt) : Number.NaN
+    out.push({ kind, leftPct: clamp(100 - fin(w.percentUsed, 100), 0, 100), resetsAt: Number.isFinite(when) && when > now ? when : null })
+  }
+
+  return out
+}
+
+async function readClaudeWindows($: Dollar, now: number): Promise<ClaudeWindow[]> {
+  try {
+    return claudeWindows((await $.session.usage()).rateLimits, now)
+  } catch {
+    return []
+  }
+}
+
+/** The Claude half of the limits row: `Claude · 5h 62% left · week 80% left` and, muted, when each resets. */
+export function claudeLimitLines(windows: ClaudeWindow[]): { main: string; resets: string } | undefined {
+  if (windows.length === 0) return undefined
+  const names = { five_hour: '5h', seven_day: 'week' } as const
+  const resets = windows.flatMap(w => (w.resetsAt === null ? [] : [resetText(w.resetsAt, w.kind === 'five_hour')]))
+
+  return { main: `Claude · ${windows.map(w => `${names[w.kind]} ${pctText(w.leftPct)}% left`).join(' · ')}`, resets: resets.length === 0 ? '' : `resets ${resets.join(' · ')}` }
+}
+
+/**
+ * The limits row, under the tiles: Claude's live windows, then the Codex plan limit as typed by hand (with the
+ * estimate of what the reviews since then used, machine-wide), the hint to type one when Codex ran and none is
+ * typed, and a link to the page that shows the real number. null when neither part has anything to say.
+ */
+function limitsRow(k: Kit, l: Layout, windows: ClaudeWindow[], limits: CodexLimits | undefined, codex: MeterCodex, now: number): RenderElement | null {
+  const { Box, Text, Link } = k
+  const room = Math.max(8, l.width - 2)
+  const claude = claudeLimitLines(windows)
+  const ran = codex.totals.runs > 0
+  const typed = limits !== undefined
+  if (claude === undefined && !typed && !ran && !codex.tooBig) return null
+  const lines: RenderElement[] = []
+  if (claude !== undefined) {
+    lines.push(
+      <Text wrap="truncate-end">{truncate(claude.main, room)}</Text>,
+      ...(claude.resets === '' ? [] : [caption(k, truncate(claude.resets, room))]),
+    )
+  }
+  const showCodex = typed || ran
+  if (limits !== undefined) {
+    const weekLeft = now < limits.weekResetAt
+    const fiveSet = limits.fiveHPct !== null && limits.fiveHResetAt !== null
+    const fiveLeft = fiveSet && now < (limits.fiveHResetAt ?? 0)
+    const parts = [weekLeft ? `week ${pctText(limits.weekPct)}% left` : 'week has reset', ...(fiveLeft ? [`5h ${pctText(limits.fiveHPct ?? 0)}% left`] : fiveSet ? ['5h has reset'] : [])]
+    lines.push(<Text wrap="truncate-end">{truncate(`Codex · ${parts.join(' · ')}`, room)}</Text>)
+    if (weekLeft) {
+      lines.push(caption(k, truncate(`resets ${resetText(limits.weekResetAt)} · typed ${agoText(now - limits.enteredAt)}`, room)))
+      const est = codexEstimate(limits, codex, now)
+      if (est !== undefined && est.reviews > 0) {
+        const plural = est.reviews === 1 ? '' : 's'
+        const full = `≈ ${pctText(est.pct)}% now (${est.reviews} plan review${plural} since × ~${CODEX_PCT_PER_REVIEW}%)`
+        lines.push(caption(k, full.length <= room ? full : truncate(`≈ ${pctText(est.pct)}% now (${est.reviews} review${plural} since)`, room)))
+      }
+    } else lines.push(caption(k, truncate('new value: /meter codex <pct> <reset>', room)))
+    if (fiveLeft) lines.push(caption(k, truncate(`5h resets ${resetText(limits.fiveHResetAt ?? 0, true)}`, room)))
+  } else if (ran) {
+    lines.push(<Text wrap="truncate-end">{truncate('Codex · limit not typed yet', room)}</Text>, caption(k, truncate('/meter codex <pct> <reset>, e.g. 97 6d2h', room)))
+  }
+  if (codex.tooBig) {
+    const full = `Codex log over 4 MB, rotate ~/${CODEX_CSV}`
+    lines.push(caption(k, full.length <= room ? full : 'Codex log over 4 MB: rotate it'))
+  }
+  if (showCodex) {
+    lines.push(
+      <Text size="caption">
+        <Link href={CODEX_USAGE_URL} label="chatgpt.com/settings/usage" />
+      </Text>,
+    )
+  }
+
+  return (
+    <Box flexDirection="column" marginTop={1} width={l.width}>
+      {lines}
+    </Box>
+  )
+}
+
+function topSection(k: Kit, l: Layout, d: MeterData, codex: MeterCodex, windows: ClaudeWindow[], limits: CodexLimits | undefined, now: number): RenderElement {
   const { Box, Text } = k
   const side = l.width >= TILES_MIN
   const tileW = Math.floor(l.width / 3)
@@ -1637,8 +1893,20 @@ function topSection(k: Kit, l: Layout, d: MeterData): RenderElement {
     </Box>
   )
   const c = cacheInfo(d)
+  // With Codex in the session the tile is the TOTAL, Claude's part and Codex's below it (the Codex one is
+  // an API-equivalent price, not a bill: the longer wording only where the tile has the room).
+  const ranCodex = codex.totals.runs > 0
+  const fits = (text: string): string => (side && text.length > tileW - 1 ? '' : text)
+  const costTile = ranCodex
+    ? tile(
+        'Session cost',
+        big(k, usd(d.costUsd + codex.totals.usd)),
+        caption(k, `Claude ${usd(d.costUsd)}`, true),
+        caption(k, fits(`Codex ≈${usd(codex.totals.usd)} API-eq`) || `Codex ≈${usd(codex.totals.usd)}`, true),
+      )
+    : tile('Session cost', big(k, usd(d.costUsd)), caption(k, 'list price'))
   const tiles = [
-    tile('Session cost', big(k, usd(d.costUsd)), caption(k, 'list price')),
+    costTile,
     tile('Context', big(k, tokens(d.contextTokens), contextZone(d.contextTokens)), caption(k, 'read each call')),
     tile('Cache', ...cacheTile(k, l, d)),
   ]
@@ -1652,13 +1920,14 @@ function topSection(k: Kit, l: Layout, d: MeterData): RenderElement {
           {`cold — next call re-writes ${tokens(d.contextTokens)}.${d.contextTokens > FRESH_AT ? ' A fresh session is cheaper.' : ''}`}
         </Text>
       ) : null}
+      {limitsRow(k, l, windows, limits, codex, now)}
     </Box>
   )
 }
 
 // -- 4. Who did the work ----------------------------------------------------
 /** One row of the agent list: every run of one agent type on one model, added up. */
-export type AgentGroup = { name: string; model: string; bucket: MeterBucket; runs: number; read: number; written: number; usd: number; running: boolean; failed: number }
+export type AgentGroup = { name: string; model: string; bucket: MeterBucket | 'codex'; runs: number; read: number; written: number; usd: number; running: boolean; failed: number }
 
 /** Runs folded into one row per (type, model), most expensive first. The stored per-run rows are not touched. */
 export function groupAgents(agents: MeterAgent[]): AgentGroup[] {
@@ -1764,35 +2033,43 @@ const barLabel = (k: Kit, text: string) => {
 export type LegendRow = { color: Color; name: string; cost: string; costPct: string; tokens: string; tokensPct: string }
 const NO_TOKENS = '—'
 
-function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
+/** What Codex adds to the "who did the work" picture: its API-equivalent dollars, the tokens it wrote and read, and how many runs. */
+const codexGroup = (codex: MeterCodex): AgentGroup | undefined =>
+  codex.totals.runs > 0 ? { name: 'codex', model: 'GPT', bucket: 'codex', runs: codex.totals.runs, read: codex.totals.input, written: codex.totals.output, usd: codex.totals.usd, running: false, failed: 0 } : undefined
+
+function workSection(k: Kit, l: Layout, d: MeterData, codex: MeterCodex): RenderElement {
   const { Box, Text } = k
   const before = beforeLoaded(d)
   // A bucket with no cost and nothing written is not drawn at all.
   const shown = BUCKETS.filter(b => d.spend[b] >= 0.005 || d.written[b] > 0)
+  const cx = codexGroup(codex)
+  // Codex is one more bucket, shown by the same rule, after the Claude ones.
+  const cxShown = cx !== undefined && (cx.usd >= 0.005 || cx.written > 0)
   // Where the charts are SVG the swatches and dots take the SVG's own hex, so a
   // legend never differs in shade from the bar it names.
   const svgOn = l.svg !== undefined
-  const tone = (b: MeterBucket): Color => (svgOn ? l.palette.bucket[b] : MODEL_COLOR[b])
+  const tone = (b: MeterBucket | 'codex'): Color => (b === 'codex' ? (svgOn ? l.palette.codex : CODEX_COLOR) : svgOn ? l.palette.bucket[b] : MODEL_COLOR[b])
   const grey: Color = svgOn ? l.palette.before : GREY
-  const costItems: Item[] = [...(before > 0 ? [{ color: grey, value: before }] : []), ...shown.map(b => ({ color: tone(b), value: d.spend[b] }))]
-  const tokenItems: Item[] = shown.map(b => ({ color: tone(b), value: d.written[b] }))
+  type Slice = { color: Color; name: string; usd: number; written: number }
+  const slices: Slice[] = [
+    ...shown.map(b => ({ color: tone(b), name: BUCKET_LABEL[b], usd: d.spend[b], written: d.written[b] })),
+    ...(cx !== undefined && cxShown ? [{ color: tone('codex'), name: CODEX_NAME, usd: cx.usd, written: cx.written }] : []),
+  ]
+  const costItems: Item[] = [...(before > 0 ? [{ color: grey, value: before }] : []), ...slices.map(x => ({ color: x.color, value: x.usd }))]
+  const tokenItems: Item[] = slices.map(x => ({ color: x.color, value: x.written }))
   // One legend for both bars, in the Cost bar's order: money first, then the tokens written. What was
   // counted before this mod loaded has money but no tokens (`—`), and is not part of the tokens' 100%.
-  const costRows = [...(before > 0 ? [{ color: grey, name: 'Before Meter loaded', value: before, bucket: undefined }] : []), ...shown.map(b => ({ color: tone(b), name: BUCKET_LABEL[b], value: d.spend[b], bucket: b }))]
+  const costRows = [...(before > 0 ? [{ color: grey, name: 'Before Meter loaded', value: before, slice: -1 }] : []), ...slices.map((x, i) => ({ color: x.color, name: x.name, value: x.usd, slice: i }))]
   const costShare = shares(costRows.map(r => r.value))
-  const tokenShare = shares(shown.map(b => d.written[b]))
-  const legend: LegendRow[] = costRows.map((r, i) => {
-    const at = r.bucket === undefined ? -1 : shown.indexOf(r.bucket)
-
-    return {
-      color: r.color,
-      name: r.name,
-      cost: `≈${usd(r.value)}`,
-      costPct: costShare[i] ?? '',
-      tokens: r.bucket === undefined ? NO_TOKENS : tokens(d.written[r.bucket]),
-      tokensPct: r.bucket === undefined ? NO_TOKENS : (tokenShare[at] ?? ''),
-    }
-  })
+  const tokenShare = shares(slices.map(x => x.written))
+  const legend: LegendRow[] = costRows.map((r, i) => ({
+    color: r.color,
+    name: r.name,
+    cost: `≈${usd(r.value)}`,
+    costPct: costShare[i] ?? '',
+    tokens: r.slice < 0 ? NO_TOKENS : tokens(slices[r.slice]?.written ?? 0),
+    tokensPct: r.slice < 0 ? NO_TOKENS : (tokenShare[r.slice] ?? ''),
+  }))
   const w = svgWidth(l)
   const stacked = (items: Item[], alt: string): RenderElement =>
     drawSvg(l, alt, w, BAR_HEIGHT, () => barSvg(items, l.palette, w)) ?? bar(k, splitParts(l.width, items))
@@ -1837,7 +2114,8 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
       </Box>
     )
 
-  const groups = groupAgents(d.agents)
+  // Codex sorts in with the agents, most expensive first; the 8-row cap counts it.
+  const groups = (cx === undefined ? groupAgents(d.agents) : [...groupAgents(d.agents), cx].sort((x, y) => y.usd - x.usd))
   const recent = groups.slice(0, 8)
   // The state reads as words while every name fits with them; one cut name and all rows use the glyph.
   const asWords = recent.map(g => agentRow(g, l.width))
@@ -1848,16 +2126,16 @@ function workSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   return section(
     k,
     'Who did the work',
-    caption(k, '≈ split of the session total by step · tokens exact'),
+    caption(k, cx === undefined ? '≈ split of the session total by step · tokens exact' : '≈ split of the session total · Codex at API price · tokens exact'),
     barLabel(k, 'Cost'),
-    stacked(costItems, `Cost by who did the work, total ${usd(d.costUsd)}`),
+    stacked(costItems, `Cost by who did the work, total ${usd(d.costUsd + (cxShown && cx !== undefined ? cx.usd : 0))}`),
     <Box marginTop={1} flexDirection="column">
       {barLabel(k, 'Tokens written')}
       {stacked(tokenItems, 'Tokens written by who did the work')}
     </Box>,
     table,
     <Box flexDirection="column" marginTop={1}>
-      {d.agents.length === 0 ? caption(k, 'no agents yet') : null}
+      {groups.length === 0 ? caption(k, 'no agents yet') : null}
       {groups.length > recent.length ? caption(k, `${groups.length - recent.length} more agent types not shown`) : null}
       {rows.length === 0 ? null : (
         <Box width={l.width} justifyContent="space-between">
@@ -2225,115 +2503,6 @@ function dollarsSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   )
 }
 
-// -- 6b. Codex: the reviews on this machine since this session started ------
-// Tokens as the log counts them: `2.8k` under 10k, then `241k`, `1.1M`.
-const codexTokens = (n: number): string => (n >= 1000 && n < 10_000 ? `${(n / 1000).toFixed(1)}k` : tokens(n))
-/** `54s`, `3m26s`, `1h02m`. */
-export const codexDuration = (s: number): string => (s < 60 ? `${Math.round(s)}s` : s < 3600 ? `${Math.floor(s / 60)}m${Math.round(s % 60)}s` : `${Math.floor(s / 3600)}h${two(Math.floor((s % 3600) / 60))}m`)
-
-/**
- * One run as text: `label · 3m26s · 241k in (199k cached) · 6.1k out · plan` plus ` · ↪ fell back` when it did,
- * and the cost to its right (`≈$0.16 if API` on a plan run, where nothing was billed; `≈$0.16` on an API run).
- * It is one line when it fits `room` characters. When it does not, the head keeps the label and the duration
- * (the label is cut first), the cost says `API-eq` instead of `if API`, and the rest moves to muted lines under it
- * (nothing is dropped). A skipped or failed run is one muted line with its reason; a skipped run has no cost.
- */
-export function codexRow(r: CodexRun, room: number): { head: string; details: string[]; cost: string; muted: boolean } {
-  const base = r.skip === '' && r.input + r.output > 0 ? `≈${usd(codexCost(r.input, r.cached, r.output))}` : ''
-  const plan = base !== '' && r.auth === 'plan' // nothing was billed on a plan run: say so
-  const reason = r.skip !== '' ? `skip: ${r.skip}` : r.exitCode !== null && r.exitCode !== 0 ? `exit ${r.exitCode}` : undefined
-  const budgetFor = (cost: string) => Math.max(8, room - cost.length - 1)
-  const long = plan ? `${base} if API` : base
-  const short = plan ? `${base} API-eq` : base
-  if (reason !== undefined) {
-    const tail = ` · ${reason}`
-
-    return { head: `${truncate(r.label, Math.max(4, budgetFor(short) - tail.length))}${tail}`, details: [], cost: short, muted: true }
-  }
-  const fb = r.fellBack ? ' · ↪ fell back' : ''
-  const tokensText = `${codexTokens(r.input)} in (${codexTokens(r.cached)} cached) · ${codexTokens(r.output)} out`
-  const full = `${r.label} · ${codexDuration(r.durationS)} · ${tokensText} · ${r.auth}${fb}`
-  if (full.length <= budgetFor(long)) return { head: full, details: [], cost: long, muted: false }
-  const tail = ` · ${codexDuration(r.durationS)}`
-  const how = `${r.auth}${fb}`
-  const joined = `${how} · ${tokensText}`
-
-  return {
-    head: `${truncate(r.label, Math.max(4, budgetFor(short) - tail.length))}${tail}`,
-    details: joined.length <= room ? [joined] : [tokensText, how],
-    cost: short,
-    muted: false,
-  }
-}
-
-function codexSection(k: Kit, l: Layout, codex: MeterCodex, limits: CodexLimits | undefined, now: number): RenderElement | null {
-  const { Box, Text, Link } = k
-  if (codex.runs.length === 0 && !codex.tooBig) return null
-  const t = codex.totals
-  const room = Math.max(8, l.width - 2)
-  // The log is over what `$.fs.read` takes: the rows below are the last good read.
-  const stale = codex.tooBig ? caption(k, `Codex log over 4 MB, rotate ~/${CODEX_CSV}`) : null
-  if (codex.runs.length === 0) return section(k, 'Codex', stale)
-  const lines: RenderElement[] = codex.runs.map(r => {
-    const row = codexRow(r, room)
-
-    return (
-      <Box flexDirection="column" width={l.width}>
-        <Box justifyContent="space-between" width={l.width}>
-          <Text dimColor={row.muted} wrap="truncate-end">
-            {row.head}
-          </Text>
-          {row.cost === '' ? null : <Text dimColor>{row.cost}</Text>}
-        </Box>
-        {row.details.map(line => (
-          <Text size="caption" dimColor wrap="truncate-end">
-            {truncate(line, room)}
-          </Text>
-        ))}
-      </Box>
-    )
-  })
-  const est = limits === undefined ? undefined : codexEstimate(limits, codex, now)
-  const weekLeft = limits !== undefined && now < limits.weekResetAt
-  const planLine =
-    limits === undefined ? (
-      caption(k, truncate('Plan limit: /meter codex <pct> <reset>', room))
-    ) : (
-      <Text wrap="truncate-end">
-        {truncate(weekLeft ? `Plan: ${pctText(limits.weekPct)}% week left · resets ${resetText(limits.weekResetAt)} · entered ${agoText(now - limits.enteredAt)}` : 'Plan: week has reset, enter a new value (/meter codex …)', room)}
-      </Text>
-    )
-  const fiveLine =
-    limits !== undefined && limits.fiveHPct !== null && limits.fiveHResetAt !== null ? (
-      <Text wrap="truncate-end">
-        {truncate(now < limits.fiveHResetAt ? `5h: ${pctText(limits.fiveHPct)}% left · resets ${resetText(limits.fiveHResetAt, true)}` : '5h: has reset, enter a new value', room)}
-      </Text>
-    ) : null
-
-  return section(
-    k,
-    'Codex',
-    stale,
-    <Box flexDirection="column">
-      {big(k, `≈${usd(t.usd)}`)}
-      {caption(k, 'since session start')}
-      {caption(k, `API-equivalent · ${t.runs} run${t.runs === 1 ? '' : 's'} · ${Math.max(t.durationS > 0 ? 1 : 0, Math.round(t.durationS / 60))} min`)}
-    </Box>,
-    <Box flexDirection="column" marginTop={1} width={l.width}>
-      {lines}
-    </Box>,
-    t.runs > 0 ? <Box marginTop={1}>{caption(k, truncate(`total ${codexTokens(t.input)} in · ${codexTokens(t.cached)} cached · ${codexTokens(t.output)} out · ≈${usd(t.usd)}`, room))}</Box> : null,
-    <Box flexDirection="column" marginTop={1} width={l.width}>
-      {planLine}
-      {fiveLine}
-      {est === undefined ? null : caption(k, truncate(`≈ ${pctText(est.pct)}% now (${est.reviews} plan review${est.reviews === 1 ? '' : 's'} since × ~${CODEX_PCT_PER_REVIEW}%)`, room))}
-      <Text size="caption">
-        <Link href={CODEX_USAGE_URL} label="chatgpt.com/settings/usage" />
-      </Text>
-    </Box>,
-  )
-}
-
 // -- 7. Guard ---------------------------------------------------------------
 function guardSection(k: Kit, d: MeterData): RenderElement {
   const { Box, Text } = k
@@ -2395,7 +2564,7 @@ export const register: Register = (on, options) => {
     await registerCommand($) // awaited: listed by the first prompt; never throws
     void $.ui.open({ id: PANE, title: TITLE }).catch(() => undefined)
     ensureTicker($)
-    await refreshCodex($) // never throws; the pane shows the section only if Codex ran on this machine since this session started
+    await refreshCodex($) // never throws; Codex shows up only for reviews this session launched
 
     return next(e)
   })
@@ -2446,8 +2615,9 @@ export const register: Register = (on, options) => {
       const d = await readData($) // never the raw stored value
       const ci = await readCi($)
       const codex = await readCodex($)
-      const limits = codex.runs.length > 0 ? await readLimits($) : undefined
+      const limits = await readLimits($)
       const nowMs = await readNow($)
+      const windows = await readClaudeWindows($, nowMs)
       const columns = e.props.bodyColumns ?? 40
       // Scale the charts to the room (up to 120 cells). Where the surface has
       // `Svg` they are drawn at 8 px a cell, in the palette of the person's theme.
@@ -2461,10 +2631,9 @@ export const register: Register = (on, options) => {
 
       return (
         <Box flexDirection="column" paddingX={1}>
-          {topSection(k, layout, d)}
-          {workSection(k, layout, d)}
+          {topSection(k, layout, d, codex, windows, limits, nowMs)}
+          {workSection(k, layout, d, codex)}
           {ciSection(k, layout, ci)}
-          {codexSection(k, layout, codex, limits, nowMs)}
           {dollarsSection(k, layout, d)}
           {guardSection(k, d)}
         </Box>
@@ -2742,8 +2911,17 @@ export const register: Register = (on, options) => {
 
   // -- GitHub PRs this session touched ----------------------------------------
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    // A review this session starts is noted BEFORE it runs: the log's row is stamped when the run ends,
+    // so a foreground run, and a background one that ends later, both come after the launch.
+    let launched: CodexLaunch[] = []
+    try {
+      launched = typeof e.command === 'string' ? await noteCodexLaunches($, e.command) : []
+    } catch {
+      // noting is a courtesy; the review itself is not held up
+    }
     const ran = await next(e)
     try {
+      if (launched.length > 0 && ran.deny !== undefined) await forgetCodexLaunches($, launched)
       // Only a command that is itself `gh pr create|view|checks|merge` may add
       // PRs: `gh pr list`, `git log`, `cat notes.md` print URLs that are not ours.
       // Only the MAIN thread's own commands count (no `agentId`): a subagent's

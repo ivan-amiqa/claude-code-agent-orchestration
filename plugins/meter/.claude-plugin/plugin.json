@@ -1,6 +1,6 @@
 {
   "name": "meter",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Live cost and agent-orchestration meter: context, cache, cost by model and subagent, GitHub checks — zero model tokens",
   "author": { "name": "Ivan Elorza" },
   "types": "./types/index.d.ts"

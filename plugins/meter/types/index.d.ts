@@ -86,7 +86,7 @@ export type MeterPr = {
 // never trusted to be complete. The tracked PRs are NOT in here: they live in
 // their own atom (key `ci`, shape `ci-1`, a `MeterPr[]`) so that a bump of this
 // tag never wipes them. The Codex runs are a third atom (key `codex`, shape
-// `codex-1`, a `MeterCodex`) for the same reason.
+// `codex-2`, a `MeterCodex`) for the same reason.
 export type MeterData = {
   /** Session cost at list price, dollars: the engine's own total. */
   costUsd: number
@@ -151,15 +151,27 @@ export type CodexRun = {
 }
 
 /**
- * The Codex runs on this machine since this session started (rows at or after the
- * session's `startedAt`; the log has no session column, so a run from another terminal counts),
- * its own atom (key `codex`, shape `codex-1`). Nothing here is read from
- * `~/.codex`; the one source is the CSV, at a fixed path.
+ * One `codex-review.sh` launch this session made: the `--label` it was given and when the Bash call started
+ * (ms, cut down to the second, because the log's timestamps are whole seconds). It is how a log row is
+ * tied to THIS session: the log has no session column.
+ */
+export type CodexLaunch = {
+  /** The label as the log would hold it: cleaned of control characters and cut to 40. */
+  label: string
+  at: number
+}
+
+/**
+ * The Codex runs THIS session launched, its own atom (key `codex`, shape `codex-2`). A log row counts
+ * only when a launch of the same label, made at or before the row's timestamp, claims it (see `parseCodex`);
+ * rows nobody claimed are another terminal's and are ignored. Nothing here is read from `~/.codex`; the
+ * one source is the CSV, at a fixed path. A stored `codex-1` value (machine-wide rows, no launches) is
+ * declined by the tag and, if one ever got through, repaired to empty.
  */
 export type MeterCodex = {
-  /** The latest rows, oldest first, at most 8. Skipped rows included. */
+  /** The latest claimed rows, oldest first, at most 8. Skipped rows included. */
   runs: CodexRun[]
-  /** Over EVERY session row read (at most the log's last 500 lines), skipped rows left out of `runs`. */
+  /** Over EVERY claimed row read (at most the log's last 500 records), skipped rows left out of the counts. */
   totals: {
     /** Rows that were not skipped. */
     runs: number
@@ -170,8 +182,10 @@ export type MeterCodex = {
     /** API-equivalent dollars: per run ((input - cached) * 2 + cached * 0.10 + output * 10) / 1e6. */
     usd: number
   }
-  /** When each plan run that finished with exit 0 ended (ms), whatever the session; at most 500. For the limit estimate only. */
+  /** When each plan run that finished with exit 0 ended (ms), whatever the session and whoever launched it; at most 500. For the limit estimate only: the limit is account-wide. */
   planDoneAt: number[]
+  /** This session's launches, oldest first, at most 100. Kept across a module reload (it is in the atom). */
+  launches: CodexLaunch[]
   /** The log is over 4 MiB, which `$.fs.read` refuses: `runs` and `totals` are the last good read, now stale. */
   tooBig: boolean
 }
