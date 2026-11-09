@@ -2852,7 +2852,7 @@ test('the section sits between GitHub and Dollars, and a missing file leaves it 
 })
 
 test('at the docked width a long run row moves its token counts to muted lines, and nothing is wider than the pane', async ($, on) => {
-  codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2), label: `acme/${'long-name-'.repeat(6)}#9`, fell_back: 'yes' }), csvRow({ timestamp: at(3), label: 'acme/web-api#12' })) })
+  codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2), label: `acme/${'long-name-'.repeat(6)}#9`, fell_back: 'yes', auth: 'api' }), csvRow({ timestamp: at(3), label: 'acme/web-api#12' })) })
   await startSession($)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface }) // bodyColumns 44 -> 42 cells
@@ -2860,12 +2860,14 @@ test('at the docked width a long run row moves its token counts to muted lines, 
     const lines = texts.map(t => t.text)
     const heads = lines.filter(t => t.includes(' · 3m26s'))
     expect(heads).toHaveLength(2)
-    for (const h of heads) expect(h.length).toBeLessThanOrEqual(42 - '≈$0.16 API-eq'.length)
+    expect(heads[0]?.length).toBeLessThanOrEqual(42 - '≈$0.16'.length) // the api row's cost is plain
+    expect(heads[1]?.length).toBeLessThanOrEqual(42 - '≈$0.16 API-eq'.length)
     expect(heads[1]).toBe('acme/web-api#12 · 3m26s') // a short label is not cut
-    expect(lines.filter(t => t === '≈$0.16 API-eq')).toHaveLength(2) // plan rows: nothing was billed
+    expect(lines.filter(t => t === '≈$0.16 API-eq')).toHaveLength(1) // the plan row: nothing was billed
+    expect(lines.filter(t => t === '≈$0.16')).toHaveLength(1) // the api row: plain
     const detail = texts.find(t => t.text.startsWith('429k in'))
     expect(detail?.props.dimColor).toBe(true)
-    expect(lines).toContain('plan · ↪ fell back') // the long row's second muted line
+    expect(lines).toContain('api · ↪ fell back') // the long row's second muted line (the script only falls back to the API)
     expect(lines).toContain('plan · 429k in (382k cached) · 2.8k out') // the short row's one
     for (const t of lines.filter(x => x.includes(' in (') || x.includes('Plan') || x.includes('plan ·'))) expect(t.length).toBeLessThanOrEqual(42)
     await ui.unmount()
@@ -2996,12 +2998,12 @@ test('/meter adds "Codex N runs ≈$X" only when this session ran Codex; the lin
   w.csv = csvOf(csvRow({ timestamp: at(2) }))
   w.mtime = 3
   const one = (await runMeter($, '')).text ?? ''
-  expect(one).toContain(' · Codex 1 run ≈$0.16')
+  expect(one).toContain(' · Codex 1 run ≈$0.16 API-eq')
   expect(one.includes('\n')).toBe(false)
 
   w.csv = csvOf(csvRow({ timestamp: at(2) }), csvRow({ timestamp: at(3) }))
   w.mtime = 4
-  expect((await runMeter($, '')).text).toContain(' · Codex 2 runs ≈$0.32')
+  expect((await runMeter($, '')).text).toContain(' · Codex 2 runs ≈$0.32 API-eq')
 })
 
 test('parseDuration and parsePercent: the shapes /meter codex takes, nothing else', () => {
@@ -3096,6 +3098,10 @@ test('without a typed limit the pane says how to enter one; once the week has re
   const text = await allText(late)
   expect(text).toContain('week has reset, enter a new value')
   expect(text).not.toContain('plan review')
+  expect(text).not.toContain('90%')
+  const reply = (await runMeter($, 'codex')).text ?? ''
+  expect(reply).toContain('week has reset, enter a new value')
+  expect(reply).not.toContain('90%')
   await late.unmount()
 })
 
@@ -3256,4 +3262,35 @@ test('parseDuration rejects minutes of 60 or more, and hours of 24 or more next 
   expect(parseDuration('1d23h59m', week)).toBe((24 * 60 + 23 * 60 + 59) * MIN)
   expect(parseCodexArgs('97 1h60m')).toBeUndefined()
   expect(parseCodexArgs('97 6d2h 5h=80 5hreset=1h60m')).toBeUndefined()
+})
+
+test('a label ending in a line break does not swallow the rows after it: the last 500 records are kept, not the last 500 lines', () => {
+  const rows = [csvRow({ label: 'acme#x\n' }), ...Array.from({ length: 499 }, (_, i) => csvRow({ label: `acme/web-api#${i}` }))]
+  const out = parseCodex(csvOf(...rows), 0)
+  expect(out.totals.runs).toBe(500)
+  expect(out.runs[out.runs.length - 1]?.label).toBe('acme/web-api#498')
+  const more = parseCodex(csvOf(csvRow({ label: 'acme#old' }), ...rows), 0) // 501 records: the oldest goes
+  expect(more.totals.runs).toBe(500)
+})
+
+test('the 5-hour part is not shown either once its window has reset', async ($, on) => {
+  const { clock } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  await startSession($)
+  await runMeter($, 'codex 90 6d 5h=33 5hreset=1h')
+  await clock.advance(2 * 60 * MIN)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  const text = await allText(ui)
+  expect(text).toContain('5h: has reset, enter a new value')
+  expect(text).toContain('Plan: 90% week left')
+  expect(text).not.toContain('33%')
+  const reply = (await runMeter($, 'codex')).text ?? ''
+  expect(reply).toContain('5h has reset')
+  expect(reply).not.toContain('33%')
+  await ui.unmount()
+})
+
+test('clean keeps a zero-width joiner, so a joined emoji is not split', () => {
+  expect(clean('👨‍👩‍👧')).toBe('👨‍👩‍👧')
+  expect(clean('a\u200db')).toBe('a\u200db')
+  expect(clean('a\u200cb\u200eb')).toBe('a b b')
 })

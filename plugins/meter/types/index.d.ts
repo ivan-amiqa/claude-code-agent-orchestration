@@ -151,7 +151,8 @@ export type CodexRun = {
 }
 
 /**
- * The Codex runs of THIS session (rows at or after the session's `startedAt`),
+ * The Codex runs on this machine since this session started (rows at or after the
+ * session's `startedAt`; the log has no session column, so a run from another terminal counts),
  * its own atom (key `codex`, shape `codex-1`). Nothing here is read from
  * `~/.codex`; the one source is the CSV, at a fixed path.
  */
@@ -176,7 +177,7 @@ export type MeterCodex = {
 }
 
 /**
- * The plan limit Ivan types in by hand (`/meter codex 97 6d2h`). Kept in
+ * The plan limit you type in by hand (`/meter codex 97 6d2h`). Kept in
  * `$.store` under the key `codex-limits-1`, so it outlives the session. The
  * reset times are stored as absolute ms (entry time + the duration typed).
  */

@@ -47,7 +47,7 @@ const data = atom({ plugin: 'meter', key: 'data' } as const, EMPTY, { shape: 'me
 const EMPTY_CI: MeterPr[] = []
 const ciAtom = atom({ plugin: 'meter', key: 'ci' } as const, EMPTY_CI, { shape: 'ci-1' })
 
-// The Codex runs of THIS session, read from the one local log `codex-review.sh`
+// The Codex runs on this machine since this session started, read from the one local log `codex-review.sh`
 // writes (see the Codex block below). Its own atom and tag, so a bump of `data`
 // or `ci` never wipes it. Bump `codex-1` only when MeterCodex itself changes.
 const EMPTY_CODEX: MeterCodex = { runs: [], totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [], tooBig: false }
@@ -113,10 +113,10 @@ export const truncate = (text: string, room: number): string => {
 // Text from outside (PR titles, check names, agent names) may hold control
 // characters; the engine refuses a whole Pane tree that has one in a text
 // child. C0 (tab, newline, CR, ESC, BEL, NUL), DEL, C1 (U+009B is CSI) and the
-// zero-width and bidi marks (U+200B-200F, U+061C, U+202A-202E, U+2066-2069), line / paragraph
+// zero-width and bidi marks (U+200B, U+200C, U+200E, U+200F, U+061C, U+202A-202E, U+2066-2069), line / paragraph
 // separators (U+2028, U+2029) and the BOM (U+FEFF) all become a space.
 // eslint-disable-next-line no-control-regex
-const CONTROL = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u061c\u200b\u200c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g
 export const clean = (s: string): string => s.replace(CONTROL, ' ')
 const MAX_NAME = 40
 /** An agent's name as stored and drawn: no control characters, at most 40 characters. */
@@ -190,7 +190,7 @@ export function summary(d: MeterData, ci: MeterPr[], codex: MeterCodex = EMPTY_C
   const agents = d.agents.length > 0 ? ` · ${d.agents.length} agent${d.agents.length === 1 ? '' : 's'}` : ''
   const prs = ci.length > 0 ? ` · CI: ${ci.length} PR${ci.length === 1 ? '' : 's'}, ${ciWorst(ci)}` : ''
 
-  const cx = codex.totals.runs > 0 ? ` · Codex ${codex.totals.runs} run${codex.totals.runs === 1 ? '' : 's'} ≈${usd(codex.totals.usd)}` : ''
+  const cx = codex.totals.runs > 0 ? ` · Codex ${codex.totals.runs} run${codex.totals.runs === 1 ? '' : 's'} ≈${usd(codex.totals.usd)} API-eq` : ''
 
   return `Session ${usd(d.costUsd)} · context ${tokens(d.contextTokens)} · ${cache}${agents}${prs}${cx}`
 }
@@ -495,7 +495,8 @@ async function commitCi($: Dollar, change: (ci: MeterPr[]) => MeterPr[]): Promis
 }
 
 // ---------------------------------------------------------------------------
-// Codex: this session's `codex-review.sh` runs, read from ONE local log.
+// Codex: the `codex-review.sh` runs on this machine since this session started, read from ONE local
+// log (it has no session column, so a run from another terminal counts too).
 //
 // The ONLY file this mod reads is `${HOME}/.amiqa/codex-review-runs.csv` (a
 // constant; no input ever builds a path). It never reads `~/.codex`, never starts
@@ -506,7 +507,7 @@ async function commitCi($: Dollar, change: (ci: MeterPr[]) => MeterPr[]): Promis
 // ---------------------------------------------------------------------------
 export const CODEX_CSV = '.amiqa/codex-review-runs.csv'
 export const CODEX_LIMITS_KEY = 'codex-limits-1'
-export const CODEX_PCT_PER_REVIEW = 0.6 // % of the weekly allowance one plan review costs (Ivan's reading)
+export const CODEX_PCT_PER_REVIEW = 0.6 // % of the weekly allowance one plan review costs (the author's rough reading, not a published number)
 export const CODEX_USAGE_URL = 'https://chatgpt.com/settings/usage'
 const MAX_CODEX_RUNS = 8 // rows drawn; the totals count every row read
 const MAX_CODEX_LINES = 500 // the log's last lines looked at
@@ -549,7 +550,7 @@ const unguard = (v: string): string => (v.length > 1 && v.startsWith("'") && '=+
 /** A count from the log: digits only, at most 12 of them; anything else is 0. */
 const codexNum = (v: string): number => (/^[0-9]{1,12}(?:\.[0-9]+)?$/.test(v.trim()) ? Math.round(Number(v)) : 0)
 
-/** API-equivalent dollars of one run, Ivan's prices (09/11, not checked against OpenAI): $2 / $0.10 cached / $10 per million tokens. */
+/** API-equivalent dollars of one run at gpt-6.1-sol's list prices: $2 in / $0.10 cached / $10 out per million tokens (not checked against OpenAI's price page). */
 export const codexCost = (input: number, cached: number, output: number): number => {
   const i = Math.max(0, fin(input, 0))
   const c = Math.max(0, fin(cached, 0))
@@ -560,8 +561,8 @@ export const codexCost = (input: number, cached: number, output: number): number
 }
 
 /**
- * The CSV's text as this session's runs. Columns are found by their HEADER NAME, so a new column
- * never moves anything; the last 500 lines at most; a row that is short, garbled or before
+ * The CSV's text as the Codex runs on this machine since `startedAt`. Columns are found by their HEADER NAME,
+ * so a new column never moves anything; the last 500 records at most; a row that is short, garbled or before
  * `startedAt` is skipped (the plan-run times, kept for the limit estimate, ignore `startedAt`).
  */
 export function parseCodex(text: string, startedAt: number): MeterCodex {
@@ -576,14 +577,16 @@ export function parseCodex(text: string, startedAt: number): MeterCodex {
   const idx = (name: string): number => col.get(name) ?? -1
   if (idx('timestamp') < 0 || idx('auth') < 0 || idx('label') < 0) return EMPTY_CODEX
   const need = Math.max(...['timestamp', 'label', 'auth', 'fell_back', 'duration_s', 'exit_code', 'input_tokens', 'cached_input_tokens', 'output_tokens'].map(idx)) + 1
-  const lines = text.slice(firstBreak + 1).split('\n')
-  if (lines[lines.length - 1] === '') lines.pop() // the file's last line break is not a line
-  const tail = lines.slice(-MAX_CODEX_LINES).join('\n')
+  // Whole text first, then the last 500 RECORDS: a cut in the middle of a quoted field (a label ending in a
+  // line break) would otherwise swallow every row after it. The file is at most 4 MiB.
+  const records = parseCsv(text.slice(firstBreak + 1))
+    .filter(r => !(r.length === 1 && r[0] === ''))
+    .slice(-MAX_CODEX_LINES)
 
   const runs: CodexRun[] = []
   const totals = { ...EMPTY_CODEX.totals }
   const planDoneAt: number[] = []
-  for (const r of parseCsv(tail)) {
+  for (const r of records) {
     if (r.length < need) continue
     const get = (name: string): string => {
       const i = idx(name)
@@ -827,12 +830,14 @@ export function codexEstimate(limits: CodexLimits, codex: MeterCodex, now: numbe
 /** The one-line answer of `/meter codex`. */
 export function limitsLine(limits: CodexLimits | undefined, codex: MeterCodex, now: number): string {
   if (limits === undefined) return 'Codex plan limit: not set. /meter codex <pct> <reset>, e.g. /meter codex 97 6d2h'
-  const reset = now >= limits.weekResetAt ? 'week has reset, enter a new value' : `resets ${resetText(limits.weekResetAt)}`
+  // Once a window has reset its old percentage is not shown at all.
+  const fiveSet = limits.fiveHPct !== null && limits.fiveHResetAt !== null
+  const five = !fiveSet ? '' : now >= (limits.fiveHResetAt ?? 0) ? ' · 5h has reset, enter a new value' : ` · 5h: ${pctText(limits.fiveHPct ?? 0)}% left, resets ${resetText(limits.fiveHResetAt ?? 0, true)}`
+  if (now >= limits.weekResetAt) return `Codex plan: week has reset, enter a new value (/meter codex <pct> <reset>)${five}`
   const est = codexEstimate(limits, codex, now)
   const estText = est === undefined ? '' : ` (≈${pctText(est.pct)}% now)`
-  const five = limits.fiveHPct !== null && limits.fiveHResetAt !== null && now < limits.fiveHResetAt ? ` · 5h: ${pctText(limits.fiveHPct)}% left, resets ${resetText(limits.fiveHResetAt, true)}` : ''
 
-  return `Codex plan: ${pctText(limits.weekPct)}% week left${estText}, ${reset}${five} · entered ${agoText(now - limits.enteredAt)}`
+  return `Codex plan: ${pctText(limits.weekPct)}% week left${estText}, resets ${resetText(limits.weekResetAt)}${five} · entered ${agoText(now - limits.enteredAt)}`
 }
 
 function withContext(d: MeterData, tokensNow: number): MeterData {
@@ -2220,7 +2225,7 @@ function dollarsSection(k: Kit, l: Layout, d: MeterData): RenderElement {
   )
 }
 
-// -- 6b. Codex: this session's reviews --------------------------------------
+// -- 6b. Codex: the reviews on this machine since this session started ------
 // Tokens as the log counts them: `2.8k` under 10k, then `241k`, `1.1M`.
 const codexTokens = (n: number): string => (n >= 1000 && n < 10_000 ? `${(n / 1000).toFixed(1)}k` : tokens(n))
 /** `54s`, `3m26s`, `1h02m`. */
@@ -2295,12 +2300,14 @@ function codexSection(k: Kit, l: Layout, codex: MeterCodex, limits: CodexLimits 
       caption(k, truncate('Plan limit: /meter codex <pct> <reset>', room))
     ) : (
       <Text wrap="truncate-end">
-        {truncate(`Plan: ${pctText(limits.weekPct)}% week left · ${weekLeft ? `resets ${resetText(limits.weekResetAt)}` : 'week has reset, enter a new value'} · entered ${agoText(now - limits.enteredAt)}`, room)}
+        {truncate(weekLeft ? `Plan: ${pctText(limits.weekPct)}% week left · resets ${resetText(limits.weekResetAt)} · entered ${agoText(now - limits.enteredAt)}` : 'Plan: week has reset, enter a new value (/meter codex …)', room)}
       </Text>
     )
   const fiveLine =
-    limits !== undefined && limits.fiveHPct !== null && limits.fiveHResetAt !== null && now < limits.fiveHResetAt ? (
-      <Text wrap="truncate-end">{truncate(`5h: ${pctText(limits.fiveHPct)}% left · resets ${resetText(limits.fiveHResetAt, true)}`, room)}</Text>
+    limits !== undefined && limits.fiveHPct !== null && limits.fiveHResetAt !== null ? (
+      <Text wrap="truncate-end">
+        {truncate(now < limits.fiveHResetAt ? `5h: ${pctText(limits.fiveHPct)}% left · resets ${resetText(limits.fiveHResetAt, true)}` : '5h: has reset, enter a new value', room)}
+      </Text>
     ) : null
 
   return section(
@@ -2309,6 +2316,7 @@ function codexSection(k: Kit, l: Layout, codex: MeterCodex, limits: CodexLimits 
     stale,
     <Box flexDirection="column">
       {big(k, `≈${usd(t.usd)}`)}
+      {caption(k, 'since session start')}
       {caption(k, `API-equivalent · ${t.runs} run${t.runs === 1 ? '' : 's'} · ${Math.max(t.durationS > 0 ? 1 : 0, Math.round(t.durationS / 60))} min`)}
     </Box>,
     <Box flexDirection="column" marginTop={1} width={l.width}>
@@ -2387,7 +2395,7 @@ export const register: Register = (on, options) => {
     await registerCommand($) // awaited: listed by the first prompt; never throws
     void $.ui.open({ id: PANE, title: TITLE }).catch(() => undefined)
     ensureTicker($)
-    await refreshCodex($) // never throws; the pane shows the section only if this session ran Codex
+    await refreshCodex($) // never throws; the pane shows the section only if Codex ran on this machine since this session started
 
     return next(e)
   })
