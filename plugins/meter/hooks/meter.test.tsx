@@ -5,7 +5,7 @@ import type { On } from 'claude-code'
 
 import type { MeterData, MeterGroup, MeterPr } from '../types'
 
-import { addToGroups, agentRow, agoText, barSvg, beforeLoaded, codexCost, codexDuration, codexEstimate, codexRow, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, niceTicks, niceTop, PALETTES, paletteFor, parseCodex, parseCodexArgs, parseCsv, parseDuration, parsePercent, PRICE_RATIO, prUrlsIn, resetText, saneCodex, saneLimits, ringSvg, rollup, sane, sanePrs, shares, splitCost, splitParts, stackCells, tokens, truncate } from './register'
+import { addToGroups, agentRow, agoText, barSvg, beforeLoaded, codexCost, codexDuration, codexEstimate, codexRow, columnColors, dollarsSvg, esc, gaugeSvg, groupAgents, labelRow, labelStart, mergePairs, clean, niceTicks, niceTop, PALETTES, paletteFor, parseCodex, parseCodexArgs, parseCsv, parseDuration, parsePercent, PRICE_RATIO, prUrlsIn, resetText, saneCodex, saneLimits, ringSvg, rollup, sane, sanePrs, shares, splitCost, splitParts, stackCells, tokens, truncate } from './register'
 
 const PANE = {
   plugin: 'meter',
@@ -2662,10 +2662,10 @@ const csvRow = (over: Record<string, string> = {}, columns = CODEX_HEADER.split(
 const csvOf = (...rowsIn: string[]) => `${CODEX_HEADER}\n${rowsIn.join('\n')}\n`
 const at = (minutes: number) => new Date(T0 + minutes * MIN).toISOString().replace('.000Z', 'Z')
 
-type CodexWorld = { csv: string | undefined; mtime: number; stats: string[]; reads: string[]; others: string[]; startedAt: number }
+type CodexWorld = { csv: string | undefined; mtime: number; size: number | undefined; failRead: boolean; gate: Promise<void> | undefined; stats: string[]; reads: string[]; others: string[]; startedAt: number }
 /** The fs, env, store and session beneath the plugin for a Codex test; the clock sits 10 minutes after T0. */
 const codexSetup = (on: On, world: Partial<CodexWorld> = {}, entries: Record<string, unknown> = {}) => {
-  const w: CodexWorld = { csv: undefined, mtime: 1, stats: [], reads: [], others: [], startedAt: T0 - MIN, ...world }
+  const w: CodexWorld = { csv: undefined, mtime: 1, size: undefined, failRead: false, gate: undefined, stats: [], reads: [], others: [], startedAt: T0 - MIN, ...world }
   quiet(on)
   const clock = mock.clock(on, { now: T0 + 10 * MIN })
   mock.env(on, { HOME: '/home/tester' })
@@ -2681,14 +2681,18 @@ const codexSetup = (on: On, world: Partial<CodexWorld> = {}, entries: Record<str
   on('ui.toast', () => ({ value: undefined }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.usage', () => ({ value: { startedAt: w.startedAt, context: { tokens: 1000, window: 1_000_000 }, rateLimits: [], cost: { usd: 1 } } }))
-  on('fs.stat', (_, e) => {
+  on('fs.stat', async (_, e) => {
     w.stats.push(e.path)
+    const gate = w.gate
+    const mtimeMs = w.mtime
+    if (gate !== undefined) await gate
     if (w.csv === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
 
-    return { value: { kind: 'file' as const, size: w.csv.length, mtimeMs: w.mtime, isLink: false } }
+    return { value: { kind: 'file' as const, size: w.size ?? w.csv.length, mtimeMs, isLink: false } }
   })
   on('fs.read', (_, e) => {
     w.reads.push(e.path)
+    if (w.failRead) throw new Error('too big for the engine')
 
     return { value: w.csv ?? '' }
   })
@@ -2847,19 +2851,23 @@ test('the section sits between GitHub and Dollars, and a missing file leaves it 
   await gone.unmount()
 })
 
-test('at the docked width a long run row moves its token counts to a second muted line, and nothing is wider than the pane', async ($, on) => {
-  codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2), label: `acme/${'long-name-'.repeat(6)}#9`, fell_back: 'yes' })) })
+test('at the docked width a long run row moves its token counts to muted lines, and nothing is wider than the pane', async ($, on) => {
+  codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2), label: `acme/${'long-name-'.repeat(6)}#9`, fell_back: 'yes' }), csvRow({ timestamp: at(3), label: 'acme/web-api#12' })) })
   await startSession($)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface }) // bodyColumns 44 -> 42 cells
-    const lines = (await ui.findAll({ type: 'Text' })).map(t => t.text)
-    const head = lines.find(t => t.includes('3m26s'))
-    expect(head).toBeDefined()
-    expect(head?.length).toBeLessThanOrEqual(42 - '≈$0.16'.length)
-    expect(head).toContain('↪ fell back')
-    const detail = (await ui.findAll({ type: 'Text' })).find(t => t.text.startsWith('429k in'))
+    const texts = await ui.findAll({ type: 'Text' })
+    const lines = texts.map(t => t.text)
+    const heads = lines.filter(t => t.includes(' · 3m26s'))
+    expect(heads).toHaveLength(2)
+    for (const h of heads) expect(h.length).toBeLessThanOrEqual(42 - '≈$0.16 API-eq'.length)
+    expect(heads[1]).toBe('acme/web-api#12 · 3m26s') // a short label is not cut
+    expect(lines.filter(t => t === '≈$0.16 API-eq')).toHaveLength(2) // plan rows: nothing was billed
+    const detail = texts.find(t => t.text.startsWith('429k in'))
     expect(detail?.props.dimColor).toBe(true)
-    for (const t of lines.filter(x => x.includes(' in (') || x.includes('Plan'))) expect(t.length).toBeLessThanOrEqual(42)
+    expect(lines).toContain('plan · ↪ fell back') // the long row's second muted line
+    expect(lines).toContain('plan · 429k in (382k cached) · 2.8k out') // the short row's one
+    for (const t of lines.filter(x => x.includes(' in (') || x.includes('Plan') || x.includes('plan ·'))) expect(t.length).toBeLessThanOrEqual(42)
     await ui.unmount()
   }
 })
@@ -2867,12 +2875,16 @@ test('at the docked width a long run row moves its token counts to a second mute
 test('codexRow: one line when it fits, split in two when it does not, a muted reason for a skipped or failed run', () => {
   const run = { label: 'acme/web-api#12', at: T0, durationS: 206, input: 241_000, cached: 199_000, output: 6_100, auth: 'plan' as const, fellBack: false, exitCode: 0, skip: '' }
   const wide = codexRow(run, 100)
-  expect(wide).toMatchObject({ head: 'acme/web-api#12 · 3m26s · 241k in (199k cached) · 6.1k out · plan', detail: undefined, muted: false })
-  expect(wide.cost).toBe('≈$0.16')
+  expect(wide).toMatchObject({ head: 'acme/web-api#12 · 3m26s · 241k in (199k cached) · 6.1k out · plan', details: [], muted: false })
+  expect(wide.cost).toBe('≈$0.16 if API') // a plan run: nothing was billed
+  expect(codexRow({ ...run, auth: 'api' }, 100).cost).toBe('≈$0.16') // an API run: plain
   const narrow = codexRow(run, 40)
-  expect(narrow.head).toBe('acme/web-api#12 · 3m26s · plan')
-  expect(narrow.detail).toBe('241k in (199k cached) · 6.1k out')
+  expect(narrow.head).toBe('acme/web-api#12 · 3m26s')
+  expect(narrow.details).toEqual(['plan · 241k in (199k cached) · 6.1k out'])
+  expect(narrow.cost).toBe('≈$0.16 API-eq')
+  expect(codexRow({ ...run, fellBack: true }, 40).details).toEqual(['241k in (199k cached) · 6.1k out', 'plan · ↪ fell back'])
   expect(codexRow({ ...run, input: 0, cached: 0, output: 0, skip: 'no_code', auth: 'none' }, 60)).toMatchObject({ head: 'acme/web-api#12 · skip: no_code', cost: '', muted: true })
+  expect(codexRow({ ...run, skip: 'no_code' }, 60).cost).toBe('') // even with token counts on the row, a skipped run shows no ≈$
   expect(codexRow({ ...run, exitCode: 4, input: 0, cached: 0, output: 0 }, 60)).toMatchObject({ head: 'acme/web-api#12 · exit 4', muted: true })
   expect(codexDuration(54)).toBe('54s')
   expect(codexDuration(206)).toBe('3m26s')
@@ -3089,7 +3101,7 @@ test('without a typed limit the pane says how to enter one; once the week has re
 
 test('codexEstimate, saneLimits, resetText and agoText', () => {
   const limits = { weekPct: 50, weekResetAt: 1000, fiveHPct: null, fiveHResetAt: null, enteredAt: 100 }
-  const codex = { runs: [], totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [50, 100, 101, 200, 300] }
+  const codex = { runs: [], totals: { runs: 0, durationS: 0, input: 0, cached: 0, output: 0, usd: 0 }, planDoneAt: [50, 100, 101, 200, 300], tooBig: false }
   expect(codexEstimate(limits, codex, 500)).toEqual({ pct: 50 - 3 * 0.6, reviews: 3 }) // strictly after the entry
   expect(codexEstimate(limits, codex, 1000)).toBeUndefined()
   expect(codexEstimate({ ...limits, weekPct: 1 }, codex, 500)?.pct).toBe(0) // never below 0
@@ -3103,4 +3115,145 @@ test('codexEstimate, saneLimits, resetText and agoText', () => {
   expect(agoText(3 * 60 * MIN)).toBe('3h ago')
   expect(agoText(5 * MIN)).toBe('5m ago')
   expect(agoText(72 * 60 * MIN)).toBe('3d ago')
+})
+
+// -- fix round: corrupt stored limits, the 4 MiB cap, invisible characters, surrogates, stricter durations ------
+test('saneLimits drops a value whose times make no sense; the corrupt one from the review draws no NaN', async ($, on) => {
+  const corrupt = { weekPct: 97, weekResetAt: 1e300, fiveHPct: null, fiveHResetAt: null, enteredAt: -1e300 }
+  expect(saneLimits(corrupt)).toBeUndefined()
+  const day = 24 * 60 * MIN
+  const ok = { weekPct: 50, weekResetAt: 1000 + 6 * day, enteredAt: 1000, fiveHPct: 40, fiveHResetAt: 1000 + 60 * MIN }
+  expect(saneLimits(ok)).toEqual(ok)
+  expect(saneLimits({ ...ok, enteredAt: 0 })).toBeUndefined() // entered after 0
+  expect(saneLimits({ ...ok, enteredAt: -5 })).toBeUndefined()
+  expect(saneLimits({ ...ok, weekResetAt: 999 })).toBeUndefined() // resets before it was entered
+  expect(saneLimits({ ...ok, weekResetAt: 1000 + 7 * day + 1 })).toBeUndefined()
+  expect(saneLimits({ ...ok, weekResetAt: 1000 + 7 * day })?.weekPct).toBe(50)
+  // the 5-hour part is dropped alone when it is out of its window; the week stays
+  expect(saneLimits({ ...ok, fiveHResetAt: 1000 + 5 * 60 * MIN + 1 })).toMatchObject({ weekPct: 50, fiveHPct: null, fiveHResetAt: null })
+  expect(saneLimits({ ...ok, fiveHResetAt: 999 })).toMatchObject({ fiveHPct: null, fiveHResetAt: null })
+  expect(saneLimits({ ...ok, fiveHPct: 101 })).toMatchObject({ fiveHPct: null, fiveHResetAt: null })
+
+  codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) }, { 'codex-limits-1': corrupt })
+  await startSession($)
+  expect((await runMeter($, 'codex')).text).toContain('not set') // the bad value is as good as none
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  const text = await allText(ui)
+  expect(text).not.toMatch(/NaN|e\+|Infinity/)
+  expect(text).toContain('Plan limit: /meter codex <pct> <reset>')
+  await ui.unmount()
+})
+
+test('a log over 4 MiB is not read: the last good rows stay with one muted line, and nothing is re-read until it changes', async ($, on) => {
+  const { w, clock } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  await startSession($)
+  expect(w.reads).toHaveLength(1)
+
+  w.size = 4 * 1024 * 1024 + 1
+  w.mtime = 2
+  await runMeter($, '')
+  await clock.advance(200_000)
+  await runMeter($, '')
+  expect(w.reads).toHaveLength(1) // not asked for, then not asked again
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 120 } })
+    const lines = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    expect(lines).toContain('Codex log over 4 MB, rotate ~/.amiqa/codex-review-runs.csv')
+    expect((await ui.find({ type: 'Text', text: /^Codex log over/ }))?.props.dimColor).toBe(true)
+    expect(lines.join('\n')).toContain('acme/web-api#12') // the last good read is still drawn
+    await ui.unmount()
+  }
+
+  w.size = undefined // rotated: small again
+  w.mtime = 3
+  w.csv = csvOf(csvRow({ timestamp: at(4), label: 'acme/web-api#40' }))
+  await runMeter($, '')
+  expect(w.reads).toHaveLength(2)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  const text = await allText(ui)
+  expect(text).not.toContain('over 4 MB')
+  expect(text).toContain('acme/web-api#40')
+  await ui.unmount()
+})
+
+test('a log that is over 4 MiB from the start shows only the muted line, and a read that fails is not retried until the file changes', async ($, on) => {
+  const { w, clock } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })), size: 5 * 1024 * 1024 })
+  await startSession($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const text = await allText(ui)
+  expect(text).toContain('Codex log over 4 MB')
+  expect(text).not.toContain('acme/web-api#12')
+  expect(w.reads).toHaveLength(0)
+  await ui.unmount()
+
+  // a read the engine refuses for another reason: tried once per file state
+  w.size = undefined
+  w.mtime = 7
+  w.failRead = true
+  await clock.advance(70_000)
+  await clock.advance(70_000)
+  await runMeter($, '')
+  expect(w.reads).toHaveLength(1)
+})
+
+test('a refresh asked for while one is running is not lost: one more follows', async ($, on) => {
+  const { w } = codexSetup(on, { csv: csvOf(csvRow({ timestamp: at(2) })) })
+  let release: () => void = () => undefined
+  w.gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const starting = startSession($)
+  while (w.stats.length === 0) await new Promise(resolve => setTimeout(resolve, 1))
+
+  w.csv = csvOf(csvRow({ timestamp: at(2) }), csvRow({ timestamp: at(3), label: 'acme/web-api#50' }))
+  w.mtime = 2
+  w.gate = undefined
+  await runMeter($, '') // asked for while the first stat is still waiting
+  release()
+  await starting
+  while (w.stats.length < 2) await new Promise(resolve => setTimeout(resolve, 1))
+  while (w.reads.length < 2) await new Promise(resolve => setTimeout(resolve, 1))
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  expect(await allText(ui)).toContain('acme/web-api#50')
+  await ui.unmount()
+})
+
+test('clean strips zero-width and bidi marks, line and paragraph separators and the BOM; a label with them is cleaned at parse time', () => {
+  expect(clean('a\u200fb\u200bc\u061cd')).toBe('a b c d')
+  expect(clean('a\u2028b\u2029c\ufeffd\u200ee')).toBe('a b c d e')
+  const out = parseCodex(csvOf(csvRow({ label: 'acme/a\u200fb\u200bc\u061cd\u2028e\ufeff#1' })), 0)
+  expect(out.runs[0]?.label).toBe('acme/a b c d e #1')
+})
+
+test('truncate never leaves half an emoji', () => {
+  const cut = truncate(`${'a'.repeat(38)}😀b`, 40)
+  expect(cut).toBe(`${'a'.repeat(38)}…`)
+  expect(/[\ud800-\udbff]$/.test(cut.slice(0, -1))).toBe(false)
+  expect(truncate(`${'a'.repeat(37)}😀bb`, 40)).toBe(`${'a'.repeat(37)}😀…`) // a whole one still fits
+  expect(truncate('😀😀😀', 3)).toBe('😀…')
+  expect(truncate('😀😀😀', 2)).toBe('…')
+  expect(truncate('abcdef', 4)).toBe('abc…')
+})
+
+test('parseCodex: with a duplicated header name the first column wins; a timestamp without the Z is rejected', () => {
+  const cols = [...CODEX_HEADER.split(','), 'label']
+  const dup = `${cols.join(',')}\n${csvRow({ label: 'acme/first#1' }, CODEX_HEADER.split(',')).concat(',acme/second#2')}\n`
+  expect(parseCodex(dup, 0).runs.map(r => r.label)).toEqual(['acme/first#1'])
+
+  const noZ = csvRow({ timestamp: '2026-11-09T09:00:00' })
+  const offset = csvRow({ timestamp: '2026-11-09T09:00:00+01:00' })
+  const dateOnly = csvRow({ timestamp: '2026-11-09' })
+  expect(parseCodex(csvOf(noZ, offset, dateOnly), 0).runs).toEqual([])
+  expect(parseCodex(csvOf(csvRow({ timestamp: '2026-11-09T09:00:00Z' })), 0).runs).toHaveLength(1)
+})
+
+test('parseDuration rejects minutes of 60 or more, and hours of 24 or more next to days', () => {
+  const week = 7 * 24 * 60 * MIN
+  for (const bad of ['1h60m', '60m', '99m', '1d24h', '1d30h', '2d25h10m']) expect(parseDuration(bad, week)).toBeUndefined()
+  expect(parseDuration('59m', week)).toBe(59 * MIN)
+  expect(parseDuration('30h', week)).toBe(30 * 60 * MIN) // hours alone may pass a day
+  expect(parseDuration('1d23h59m', week)).toBe((24 * 60 + 23 * 60 + 59) * MIN)
+  expect(parseCodexArgs('97 1h60m')).toBeUndefined()
+  expect(parseCodexArgs('97 6d2h 5h=80 5hreset=1h60m')).toBeUndefined()
 })

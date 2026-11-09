@@ -171,6 +171,8 @@ export type MeterCodex = {
   }
   /** When each plan run that finished with exit 0 ended (ms), whatever the session; at most 500. For the limit estimate only. */
   planDoneAt: number[]
+  /** The log is over 4 MiB, which `$.fs.read` refuses: `runs` and `totals` are the last good read, now stale. */
+  tooBig: boolean
 }
 
 /**
