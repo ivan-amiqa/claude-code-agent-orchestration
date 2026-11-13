@@ -24,20 +24,41 @@ mkdir -p .claude/agents && cp claude-code-agent-orchestration/.claude/agents/*.m
 
 ### Optional: the guard hooks
 
-The agents work on their own. Two hooks make the rules harder to forget. They need `jq` and are per project: copy them next to your agents.
+The agents work on their own. The hooks make the rules harder to forget. They need `jq` (the merge gate also needs `python3`, `perl` and `gh`) and are per project: copy them next to your agents.
 
 ```bash
 mkdir -p .claude/hooks && cp claude-code-agent-orchestration/.claude/hooks/*.sh .claude/hooks/ && chmod +x .claude/hooks/*.sh
 cp claude-code-agent-orchestration/.claude/settings.json .claude/settings.json   # or merge its `hooks` and `permissions` blocks into yours
 ```
 
-- [`delegation-guard.sh`](.claude/hooks/delegation-guard.sh) reminds the boss to delegate (after 6 code-reading calls with no scout/log-digger, after 4 code edits with no implementer, and on `gh pr create`/`merge` with no verifier run). It **blocks** a PR merge unless `pr-reviewer` was started on that PR after the last code change. It catches an unquoted `gh pr merge` (any flags, so `--auto` too) or `…/pulls/N/merge` API call; quoted or wrapped forms (`sh -c '…'`, a quoted API path, `"gh"`) are not seen, and neither are the desktop app's own auto-merge tool (`mcp__ccd_pr__set_auto_merge`), a GraphQL `enablePullRequestAutoMerge` call or the GitHub web UI. It is a guardrail, not a security boundary. It only knows the reviewer was started, not its verdict: read it before you merge. If the review happened elsewhere, add `# reviewed-by: <reason>` to the merge command. Thresholds and the folders it treats as "not code" are environment variables, documented at the top of the script.
+- [`delegation-guard.sh`](.claude/hooks/delegation-guard.sh) reminds the boss to delegate (after 6 code-reading calls with no scout/log-digger, after 4 code edits with no implementer, and on `gh pr create`/`merge` with no verifier run). It **blocks** a PR merge unless `pr-reviewer` was started on that PR after the last code change. A Bash merge has to be one plain command that fits a short allowlist (no `$(...)`, backticks, `||`, `&`, subshells, heredocs, `bash -c`, `eval` or `curl`); anything the guard can't read exactly is denied, so it fails closed. `gh api …/pulls/N/merge` and the desktop app's own auto-merge tool (`mcp__ccd_pr__set_auto_merge`) are gated too. When the command doesn't name the PR, the guard looks it up with one bounded `gh pr view` call (killed after a few seconds; a timeout denies). It is a guardrail, not a security boundary: deliberate dodges (`python3 -c`, a `gh` alias, a GraphQL `mergePullRequest`) are out of scope. It only knows the reviewer was started, not its verdict: read it before you merge. If the review happened elsewhere, or you are deliberately merging your own work, add a comment on the same line as the merge: `# reviewed-by: <reason>`. Its counters live in a per-user folder (mode 0700); if that folder or the session id looks wrong, merges are denied rather than waved through.
+- [`secret-guard.sh`](.claude/hooks/secret-guard.sh) blocks a Bash command that contains a literal key (common token shapes) or prints a macOS Keychain secret bare. A regex safety net, not the control: the rule in `CLAUDE.md.example` is what holds.
+- [`goal-inject.sh`](.claude/hooks/goal-inject.sh) keeps the original goal alive across days and compactions. When a prompt names a task thread file, it injects the top of that file (everything above `## Agenda`) once per session; a long brief that names no thread file gets one warning. See "Task threads" in `CLAUDE.md.example`.
 - [`worktree-guard.sh`](.claude/hooks/worktree-guard.sh) never blocks. Before a state-changing `git`/`gh` command it prints which repo and branch it will hit.
-- [`context-size-guard.sh`](.claude/hooks/context-size-guard.sh) never blocks. When the main session passes 350k tokens of context it mentions it once; at 500k it recommends `/compact` or a fresh session, because every step re-reads the whole context. Thresholds: `CONTEXT_WARN_1`, `CONTEXT_WARN_2`.
+- [`context-size-guard.sh`](.claude/hooks/context-size-guard.sh) never blocks. When the main session passes 350k tokens of context it mentions it once; at 500k it recommends `/compact` or a fresh session, because every step re-reads the whole context.
 
-`.claude/settings.json` also carries a `permissions.deny` block for `mcp__ccd_session__start_session` and `mcp__ccd_session__hand_off_to_session`, the Claude desktop app's session tools. It is what enforces the "one session, sub-agents only" rule in [`CLAUDE.md.example`](CLAUDE.md.example): Claude can't start or hand off to another session, only you can. Merge it into your own settings if you use the desktop app.
+All the knobs are optional environment variables, documented at the top of each script:
 
-To disable one, delete its entry from `.claude/settings.json`; to disable all, delete the file or the `hooks` block. Without `jq` the delegation checks switch themselves off, except that merges are refused rather than waved through.
+| Variable | Default | What it does |
+|---|---|---|
+| `DELEGATION_GUARD_READ_LIMIT` | `6` | code-reading calls before the scout reminder |
+| `DELEGATION_GUARD_EDIT_LIMIT` | `4` | code edits before the implementer reminder |
+| `DELEGATION_GUARD_IGNORE_GLOB` | `docs/*:*/docs/*:memory/*:*/memory/*` | colon-separated path globs that are not code (they never count towards the limits) |
+| `DELEGATION_GUARD_GH_TIMEOUT` / `DELEGATION_GUARD_DEADLINE` | `10` / `11` | seconds for the one `gh pr view` lookup, and the overall budget (both capped at 12, under the hook's 15 s timeout) |
+| `CONTEXT_WARN_1` / `CONTEXT_WARN_2` | `350000` / `500000` | context size (tokens) for the two reminders |
+| `GOAL_INJECT_GLOB` | `docs/threads/task-*.md` | where task thread files live (one glob, or several separated by colons) |
+| `TMPDIR` | `/tmp` | where the hooks keep their per-session state |
+
+`.claude/settings.json` also carries a `permissions` block: `git push` is denied (Claude asks you to run it, so nothing leaves your machine without your OK), a short allow list of read-only `gh` commands (`pr view/checks/list/diff`, `run view/list/watch`), and a deny for `mcp__ccd_session__start_session` and `mcp__ccd_session__hand_off_to_session`, the Claude desktop app's session tools. That last one is what enforces the "one session, subagents only" rule in [`CLAUDE.md.example`](CLAUDE.md.example): Claude can't start or hand off to another session, only you can. Merge what you want into your own settings.
+
+To disable one hook, delete its entry from `.claude/settings.json`; to disable all, delete the file or the `hooks` block. Without `jq` the delegation checks switch themselves off, except that merges are refused rather than waved through.
+
+The hooks have tests, in [`.claude/hooks/tests/`](.claude/hooks/tests/). They use fake hook inputs, a stub `gh` and a temp folder, and touch nothing else:
+
+```bash
+bash .claude/hooks/tests/context-size-guard.test.sh     # context-size-guard, goal-inject, secret-guard, settings.json
+/bin/bash .claude/hooks/tests/delegation-guard.test.sh  # the merge gate and the reminders
+```
 
 Then let Claude fit them to your project. Paste this into Claude Code:
 
@@ -105,6 +126,8 @@ It reads your local logs in `~/.claude/projects`, needs only Python 3, and sends
 One trap it avoids: don't select sessions by file date. Claude Code can touch old session files, and our first count of "the last two weeks" silently included two older months.
 
 ## Updates
+
+**Update, November 2026:** the delegation guard now blocks only what it can read exactly (a merge must be one plain command that fits an allowlist, and it fails closed otherwise); it also gates the desktop app's auto-merge tool, uses a per-user state folder, and looks the PR up with one bounded `gh` call. New hooks: `secret-guard.sh` and `goal-inject.sh`, plus tests for all of them. `CLAUDE.md.example` grew into a template with sections for security by design, the usage budget, plan mode, task threads, verification and reporting. The agents gained a colour each, a verbatim-evidence rule, and generic security invariants in `pr-reviewer`. `settings.json` denies `git push` and allows read-only `gh` commands.
 
 **Update, October 2026:** the repo now ships the hooks above (`delegation-guard.sh`, `worktree-guard.sh`) and a `.claude/settings.json` that wires them in. `CLAUDE.md.example` gained the stricter delegation rules (the main session opens at most one known file; every test-suite run goes to `log-digger`; what stays in the main session; effort pinned on the Opus and Sonnet agents; the `model: "sonnet"` override is an alias), `scout` and `log-digger` now carry `disallowedTools: Agent` so rule 1 is literally true in every file, and `verifier` names any stale doc it finds.
 
