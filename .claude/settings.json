@@ -1,6 +1,16 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(gh pr view:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run watch:*)"
+    ],
     "deny": [
+      "Bash(git push:*)",
       "mcp__ccd_session__start_session",
       "mcp__ccd_session__hand_off_to_session"
     ]
@@ -12,17 +22,27 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/secret-guard.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/worktree-guard.sh"
           }
         ]
       },
       {
-        "matcher": "Bash|Read|Grep|Glob|Agent|Edit|Write|NotebookEdit",
+        "matcher": "Bash|Read|Grep|Glob|Agent|Edit|Write|NotebookEdit|mcp__ccd_pr__set_auto_merge",
         "hooks": [
           {
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/delegation-guard.sh",
-            "timeout": 5
+            "timeout": 15
           }
         ]
       }
@@ -34,6 +54,17 @@
           {
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/context-size-guard.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/goal-inject.sh",
             "timeout": 5
           }
         ]

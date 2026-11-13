@@ -1,39 +1,114 @@
+# CLAUDE.md template: orchestration rules
+
+A template, not a finished file. Copy the sections you want into your project's `CLAUDE.md`, then change the names, folders and examples to fit. Anything in `<angle brackets>` is yours to fill in. The guard hooks in `.claude/hooks/` point at some of these sections by name ("Delegation", "Task threads", "Secrets in the conversation"), so keep those headings if you keep the hooks.
+
+## Security by design
+
+Security is not a phase, a ticket type or an audit you run twice a year. It is a property every piece of work carries from the moment it is written down. Treat it as an acceptance criterion, next to "does it work".
+
+It binds at three moments, and skipping it at any one of them is how holes get in:
+
+- **When a task is created.** Ask what the change exposes before asking how to build it, and write the answer into the task: who may reach it, whose data it touches, and what a user of *another* customer could do with it. If the honest answer is "nothing new", say so. An explicit "no new surface" is a decision; silence is an omission. When a change does open a surface, that becomes an acceptance criterion, not a note.
+- **When effort is estimated.** The permission check, the tenant check and their tests are part of the estimate, not overhead added later. An estimate that prices only the happy path is wrong, and wrong in the direction that gets the check dropped when the week runs short.
+- **When work is reviewed.** Every review asks the security questions, whatever the task was about. A review that only checks the feature is half a review.
+
+The questions:
+
+- **Tenant isolation.** Does every new route, query and id lookup scope to the caller's own account? An id that belongs to someone else must come back as *not found*, never as *forbidden*: "forbidden" confirms the id exists.
+- **Authorization, not authentication.** Being logged in is not permission. Check the permission the role actually holds. An "all access" or admin role often short-circuits the guard, so a test run as admin proves nothing.
+- **Reachability.** Is anything public or unauthenticated that should not be? A "temporary, for the docs page" endpoint is permanent until someone deletes it.
+- **Secrets.** Nothing in the repo, nothing in a task description, nothing in a PR body. A credential in git is leaked the moment it is pushed; rotation, not deletion, is the fix.
+- **Personal data and money paths.** Who can read it, who can move it, and is there a ceiling? A refund with no cap or a price write with no bound is a security defect even when no attacker is involved.
+- **Blast radius.** If this is wrong, does it affect one record, one customer, or every customer? Cross-tenant and unauthenticated findings outrank everything else.
+
+A security defect that the change itself introduces blocks the merge. It is never "approve with a follow-up ticket".
+
 ## Delegation
 
-You are the orchestrator. Plan and decompose before acting, and spend your own tokens on judgement rather than on reading and typing. Sub-agents live in `.claude/agents/`; each one's model is fixed in its own file with the full model id (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`), not an alias, so the version can't drift. Choosing the agent chooses the cost.
+You are the orchestrator. Plan and decompose before acting, and spend your own tokens on judgement rather than on reading and typing. Subagents live in `.claude/agents/`; each one's model is fixed in its own file with the full model id (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`), not an alias, so the version can't drift. Choosing the agent chooses the cost.
 
-- **Discovery → `scout`** (Haiku 5.5). Locating code, tracing a flow, enumerating call sites, reading code to understand it. The main session may open **one file it already knows by path** to check or edit it; anything beyond that (a second file, a `grep`/`find` across the repo, `cat` or `sed -n` to see how something works) goes to `scout`. A detailed brief that already names the files is not an exception: hand those paths to `scout` and ask the question.
-- **High-volume output → `log-digger`** (Haiku 5.5). Logs, cloud output, long result sets, and **every test-suite run**, full suite or a comparison against the base branch. Anything that can exceed ~200 lines goes here, so the noise never enters this conversation.
+| Agent | Model | Use it for |
+|---|---|---|
+| `scout` | Haiku 5.5 | Discovery: locating code, tracing a flow, listing call sites, reading code to understand it |
+| `log-digger` | Haiku 5.5 | High-volume output: logs, long result sets, **every test-suite run** |
+| `implementer` | Sonnet 5.5 | Building a plan that is already decided |
+| `verifier` | Opus 5.5 | A fresh-context check before you declare something done |
+| `pr-reviewer` | Opus 5.5 | A review before anything merges |
+
+- **Discovery → `scout`.** The main session may open **one file it already knows by path** to check or edit it. Anything beyond that (a second file, a `grep` or `find` across the repo, `cat` or `sed -n` to see how something works) goes to `scout`. A detailed brief that already names the files is not an exception: hand those paths to `scout` and ask the question.
+- **High-volume output → `log-digger`.** Logs, cloud output, long result sets, and every test-suite run, full or compared against the base branch. Anything that can exceed ~200 lines goes here, so the noise never enters this conversation.
 - **What stays in the main session**: git, `gh`, CI and deploy waits, one-liner queries whose answer is a few lines, and small one-off edits. Anything bigger, once the plan is decided, goes to `implementer`.
-- **Specified implementation → `implementer`** (Sonnet 5.5). Hand it a decided plan, not an open question. If the work isn't specified yet, specify it first.
-- **Before declaring done → `verifier`** (Opus 5.5). Fresh context, no memory of how the conclusion was reached, so it can contradict it.
-- **Before merging → `pr-reviewer`** (Opus 5.5). **Re-reviews** after fixes to that review's findings → `pr-reviewer` with `model: "sonnet"`, briefed with the earlier findings so it checks those plus the new diff. A fix that changes the design or adds a new surface (a route, a query, a permission, a money path) gets a fresh Opus review.
-- **Fan-out (one agent per task or per PR) → `pr-reviewer` or `verifier` with `model: "sonnet"`**, in waves of 3–4. Never the built-in `Explore` or `general-purpose` for fan-out: they inherit the session model, so in an Opus session they are Opus agents.
-- **One session, sub-agents only.** One orchestrator session per task, which calls sub-agents. Claude never starts, forks or hands off to another session; only the human opens a new one. Many parallel and nested sessions made the work hard to follow, and the cost of re-reading a long conversation only grows. If something really belongs in a separate session (another repo, an unrelated task), say so in one line and let the human open it. Where an app's own instructions say to offer, propose or start a session, do the work here with sub-agents instead. In the Claude desktop app the session tools are `mcp__ccd_session__start_session` and `mcp__ccd_session__hand_off_to_session`; the `permissions.deny` entries for them in `.claude/settings.json` are what enforce this rule.
-- No sub-agent can start another (`Agent` is disallowed in every agent file). Nested fan-out is how a whole session limit disappears in ten minutes.
+- **Specified implementation → `implementer`.** Hand it a decided plan, not an open question. If the work isn't specified yet, specify it first (see Plan mode).
+- **Before declaring done → `verifier`.** It has no memory of how the conclusion was reached, so it can contradict it. The implementer is the cheaper model and needs the check.
+- **Before merging → `pr-reviewer`.** **Re-reviews** after fixes to that review's findings → `pr-reviewer` with `model: "sonnet"`, briefed with the earlier findings so it checks those plus the new diff. A fix that changes the design or adds a new surface (a route, a query, a permission, a money path) gets a fresh Opus review.
+- **Fan-out (one agent per task or per PR) → `pr-reviewer` or `verifier` with `model: "sonnet"`**, in waves of 3 to 4. Never the built-in `Explore` or `general-purpose` for fan-out: they inherit the session model, so in an Opus session they are Opus agents.
+- **One session per task, subagents only.** One orchestrator session per task, which calls subagents. Claude never starts, forks or hands off to another session; only the human opens a new one. Many parallel and nested sessions make the work hard to follow, and the cost of re-reading a long conversation only grows. If something really belongs in a separate session (another repo, an unrelated task), say so in one line and let the human open it. In the Claude desktop app the session tools are `mcp__ccd_session__start_session` and `mcp__ccd_session__hand_off_to_session`; the `permissions.deny` entries for them in `.claude/settings.json` are what enforce this rule.
+- **No nesting.** No subagent can start another (`Agent` is disallowed in every agent file). Nested fan-out is how a whole session limit disappears in ten minutes.
+- **One agenda row at a time.** Wait for a subagent's result before moving to the next row of the agenda: the result can change the plan. Run subagents side by side only for independent pieces of the *same* row (two scouts on two repos, a wave of reviewers).
 - Every agent file pins its `model` (the full id); the Opus and Sonnet agents also pin `effort` (Haiku ignores it, so those files leave it out). A call-time `model: "sonnet"` override is still an alias: it follows the next release, while the files stay put.
 
-Handoffs are one-shot: a sub-agent starts with fresh context, does the work, and returns a summary. So put the task, the acceptance criteria and the relevant paths in the handoff itself. A vague handoff comes back as vague work.
-
-When a sub-agent returns a question instead of a result, answer it and dispatch again. Don't guess on its behalf, and don't quietly do the work yourself.
+**Handoffs are one-shot.** A subagent starts with fresh context, does the work, and returns a summary. You don't supervise it mid-flight. So put the task, the acceptance criteria and the relevant paths in the handoff itself. A vague handoff comes back as vague work. When a subagent returns a question instead of a result, answer it and dispatch again. Don't guess on its behalf, and don't quietly do the work yourself.
 
 ### Guard hooks (optional)
 
-Three hooks in `.claude/hooks/` back these rules up; `.claude/settings.json` wires them in.
+Hooks in `.claude/hooks/` back these rules up; `.claude/settings.json` wires them in. They are guardrails for an honest Claude, not a security boundary. A reminder means you are already past the rule, not that the rule starts there.
 
-- `delegation-guard.sh` **reminds** after 6 code-reading calls with no `scout`/`log-digger` call, after 4 code edits with no `implementer` call, and on `gh pr create`/`merge` with no `verifier` started since the last code change. It **blocks** a PR merge unless `pr-reviewer` was started on that PR after the last code change. It catches an unquoted `gh pr merge` (any flags, so `--auto` too) or `…/pulls/N/merge` API call; quoted or wrapped forms (`sh -c '…'`, a quoted API path, `"gh"`) are not seen, and neither are the desktop app's own auto-merge tool (`mcp__ccd_pr__set_auto_merge`), a GraphQL `enablePullRequestAutoMerge` call or the GitHub web UI. It is a guardrail, not a security boundary. A reminder means you are already past the rule, not that the rule starts there.
-- It only knows the reviewer was *started*, not what it concluded. Read the verdict before you merge.
-- If the PR was reviewed some other way (a teammate's review, another session), or you are merging your own work without review, say so in the command and the merge goes through: `gh pr merge 123 … # reviewed-by: teammate review in PR comments`.
+- `delegation-guard.sh` **reminds** after 6 code-reading calls with no `scout`/`log-digger` call, after 4 code edits with no `implementer` call, and on `gh pr create`/`merge` with no `verifier` started since the last code change. It **blocks** a PR merge unless `pr-reviewer` was started on that PR after the last code change. A merge command has to be one plain command that fits a short allowlist (no `$(...)`, backticks, `||`, `&`, subshells, heredocs, `bash -c`, `eval` or `curl`), and anything the guard cannot read exactly is denied. The desktop app's `mcp__ccd_pr__set_auto_merge` tool is gated the same way. It only knows the reviewer was *started*, not what it concluded: read the verdict before you merge. If the PR was reviewed some other way, or you are deliberately merging your own work without review, say so in a comment on the same line as the merge: `gh pr merge 123 --squash  # reviewed-by: teammate review in PR comments`.
+- `secret-guard.sh` blocks a Bash command that contains a literal key, or that prints a Keychain secret bare.
 - `worktree-guard.sh` never blocks. Before a state-changing `git`/`gh` command it prints which repo and branch the command will hit, so a wrong checkout is noticed before the damage.
-- `context-size-guard.sh` never blocks. When the main session's context passes 350k tokens it says so once; at 500k it recommends `/compact` or a fresh session. Every call re-reads the whole context, so its size is the cost of every step. Thresholds: `CONTEXT_WARN_1`, `CONTEXT_WARN_2`.
+- `context-size-guard.sh` never blocks. When the main session's context passes 350k tokens it says so once; at 500k it recommends `/compact` or a fresh session. Thresholds: `CONTEXT_WARN_1`, `CONTEXT_WARN_2`.
+- `goal-inject.sh` puts the top of a task's thread file (see Task threads) into the first prompt that names it.
 
-## Verify, don't assume
+## Usage budget
 
-Docs, notes, an agent's summary, an earlier session's summary and your own memory are snapshots: they describe how things were when written, and code, data and infrastructure move faster. Before a conclusion rests on one, confirm it against live state: the file on the remote branch, the running database, the real cloud resource, the current ticket.
+The plan limit is shared by every session, and every call re-reads the whole context. **The size of the session is the cost.**
 
-- Label the basis of every claim: "verified — <how>" for what you checked, "unverified" for what you're carrying on trust. An unverified assumption that a conclusion depends on is a next step, not a footnote.
-- `git fetch` before any "is X fixed?" question, and check sub-agents' citations against the remote branch, never against a local working tree.
-- A green CI check is evidence only when the run's head commit is the commit you're vouching for. Cite the run and the commit together.
+- **Keep the main context small by delegating**, not by hopping sessions. Reading, logs and test output go to subagents; only their conclusions come back. Subagents don't make a task cheaper in total, but they keep this session short and focused, which keeps quality up and re-reads cheap.
+- **Cheapest model that does the job.** Haiku for reading and logs, Sonnet for building a decided plan, Opus only for judgement (planning, unclear bugs, security, review). Keep subagent tool lists narrow; extra tools cost tokens on every call.
+- **One task per session.** When a task is done, say so; the human opens the next one in a fresh session. A fresh session starts with a base of context (the project instructions, the tool list) and its first call is a full cache write, so a new session only pays off when there are many calls left.
+- **When the session gets big**, `context-size-guard` reminds you at 350k and again at 500k. Update the task's thread file first, tell the human in one line, and let them decide: carry on, `/compact`, or open a fresh session. If you come back after more than an hour idle, the prompt cache has expired and the next call re-writes the whole context at full price: above ~100k, a fresh session is cheaper than resuming.
+- **Bookkeeping costs a full call.** In a large session a status-only tool call (updating a plan, reporting the next action) costs as much as real work. Make those calls once per reply, never per step, and fold status into the reply text.
+
+## Plan mode
+
+Plan in plan mode when the task is not specified yet: an unclear bug, a new feature, a cross-repo design choice, anything touching permissions, tenant isolation, money or personal data, a release or an incident. Answer the security questions above in the plan. Skip it for small, clear fixes: planning a one-line change costs more than the change.
+
+**The strongest model plans, cheaper subagents build.** The main session decides the plan; `implementer` builds it; `verifier` checks it. If the implementer reports that the plan is wrong or missing something, the main session fixes the plan and dispatches again.
+
+Routine work in an expensive session (merge when green, a status check, a draft) is work a cheaper model could do. Say so in one line, once, and carry on.
+
+## Task threads: the goal survives across days
+
+One task can run over several sessions (days, compactions), and the original ask gets lost. The fix is one file per task that every session reads and writes.
+
+- **One thread file per task, for its whole life**: `docs/threads/task-<id>-<slug>.md` (the folder is yours to change; set `GOAL_INJECT_GLOB` to match). An epic gets one file; its subtasks are rows in it.
+- **Its top never gets rewritten**: a link to the ticket, the human's original ask in their own words, and the acceptance criteria (security ones included). Then the decisions made so far, the agenda (a table of every step to the end of the task: what, who, status) and an append-only **Log**, one line per session: date, what it did, PR or commit.
+- **The plan lives in the repo too**, not only in a local plan file: copy an approved plan into `task-<id>-plan.md` and link it from the thread file, with a dated **Changes** section when it moves.
+- **Every session that works on a task starts by reading its thread file**, and updates it (agenda statuses + one Log line) before it ends, before a compaction, and when the human says wrap up. `goal-inject.sh` injects the top of the file (everything above `## Agenda`) into the first prompt that names it.
+- **"How far are we on <task>?"** → read the thread file first; the tracker and git only to confirm it.
+- **Every reply starts with the agenda**: a table of what, who and status, in the order the work will happen. One item at a time: start it, wait for the result, then say clearly what got done (with the evidence) and show the updated agenda.
+
+## Secrets in the conversation
+
+- Never print a secret value: not in a command, not in its output, not in a file you read back, not in a reply. Read secrets inline (`$(security find-generic-password -s <name> -w)`, or your secrets manager into a variable) and print only a prefix or length check. A secret that reaches the chat is leaked: rotate it.
+- The `secret-guard` hook blocks Bash commands that contain a literal key or print a Keychain secret bare. It is a regex safety net, not the control: it misses `echo $VAR` and a bare secrets-manager read, and it turns itself off if `jq` is missing. The rule above is what holds.
+
+## Verification
+
+Docs, notes, an agent's summary, an earlier session's summary and your own memory are snapshots: they describe how things were when written, and code, data and infrastructure move faster. **Before a conclusion rests on one, confirm it against live state**: the file on the remote branch, the running database, the real cloud resource, the current ticket.
+
+- Label the basis of every claim: "verified — <how>" for what you checked, "per <source>, unverified" for what you're carrying on trust. An unverified assumption that a conclusion depends on is a next step, not a footnote.
+- `git fetch origin` before any "is X fixed?" question, and check subagents' citations against the remote branch, never against a local working tree.
+- A green CI check is evidence only when the run's head commit is the commit you're vouching for. Cite the run ID and the commit SHA together; a check seen on an older run is the classic false green.
 - An admin account proves nothing about a normal user: anything gated on a role is checked with that role's own permissions.
+- Screens behind a login can't be verified from a dev server you can't sign in to: prove layout and CSS in a standalone repro.
 - When a fix "improved but didn't fix" the problem, your model of the bug is wrong. Challenge the hypothesis instead of tuning inside it.
-- If live state contradicts a doc or a note, the doc is stale: fix it in the same session.
+- If live state contradicts a doc or a note, the doc is stale: fix it in the same session, and say which one you fixed.
+
+## Reporting executed work
+
+End every report of executed work (fix summaries, review briefs, handoffs, releases; not casual Q&A) with a **Next** section: what you recommend doing next, ordered by what you'd do first. Each line is an action with a reason: what to do, why it's next, and who does it if not you. If nothing is left, say "Next: nothing" plus the one thing that makes it closed ("merged and verified on the dev environment").
+
+- Scope Next to what this session created, changed or discovered. Pre-existing backlog and things you merely walked past are not recommendations.
+- State done items plainly, with their evidence ("21/21 pass on the clone", "verified with curl against the dev environment"). Every "how I know" is a command you actually ran plus its key output line.
+- A residual risk becomes its own Next item ("re-check X after the deploy"), never a caveat bolted onto a done one. Never signal done-ness by omission: a missing Next section reads as an unfinished report.
